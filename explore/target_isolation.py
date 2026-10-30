@@ -43,6 +43,7 @@ INPUT_CHAIN = "RSI_TARGET_IN"
 OUTPUT_CHAIN = "RSI_TARGET_OUT"
 L2_CHAIN = "RSI_TARGET_L2"
 MAX_PREFACE_BYTES = 65_536
+_EBTABLES_CHAIN_INIT_TRANSIENT = "ebtables: No chain/target/match by that name"
 
 
 class RSIEgressError(RuntimeError):
@@ -902,7 +903,9 @@ else
   test -z "$(ip -6 route show default)"
 fi
 
-ebtables -N {L2_CHAIN} 2>/dev/null || true
+if ! ebtables -L {L2_CHAIN} >/dev/null 2>&1; then
+  ebtables -N {L2_CHAIN}
+fi
 ebtables -F {L2_CHAIN}
 while ebtables -D INPUT -i qemu -j {L2_CHAIN} 2>/dev/null; do
   :
@@ -958,30 +961,39 @@ def install_outer_firewall_receipt(
 
     script = _firewall_script(
         mode=mode, gateway_ip=gateway_ip, ports=ports)
-    try:
-        result = container.exec_run(
-            ["sh", "-ceu", script], user="root", privileged=False)
-    except Exception as exc:  # noqa: BLE001 - Docker SDK boundary
-        raise RSIEgressError(
-            f"outer-container firewall install failed: {type(exc).__name__}") \
-            from exc
-    code, output = _exec_result(result)
     marker = f"RSI_EGRESS_SEAL_OK={mode}"
-    ipv6_markers = [
-        line.split("=", 1)[1] for line in output.splitlines()
-        if line.startswith("RSI_EGRESS_IPV6_MODE=")]
     accepted_ipv6 = {
         "ip6tables-plus-ebtables",
         "ebtables-authoritative-no-outer-ipv6",
     }
-    if (code != 0 or marker not in output or len(ipv6_markers) != 1
-            or ipv6_markers[0] not in accepted_ipv6):
-        raise RSIEgressError(
-            f"outer-container firewall verification failed (exit {code}): "
-            f"{output[-1000:]}")
-    return OuterFirewallReceipt(
-        rules_sha256=hashlib.sha256(script.encode("utf-8")).hexdigest(),
-        ipv6_enforcement=ipv6_markers[0])
+    code, output = 1, ""
+    for attempt in range(2):
+        try:
+            result = container.exec_run(
+                ["sh", "-ceu", script], user="root", privileged=False)
+        except Exception as exc:  # noqa: BLE001 - Docker SDK boundary
+            raise RSIEgressError(
+                f"outer-container firewall install failed: {type(exc).__name__}") \
+                from exc
+        code, output = _exec_result(result)
+        ipv6_markers = [
+            line.split("=", 1)[1] for line in output.splitlines()
+            if line.startswith("RSI_EGRESS_IPV6_MODE=")]
+        if (code == 0 and marker in output and len(ipv6_markers) == 1
+                and ipv6_markers[0] in accepted_ipv6):
+            return OuterFirewallReceipt(
+                rules_sha256=hashlib.sha256(script.encode("utf-8")).hexdigest(),
+                ipv6_enforcement=ipv6_markers[0])
+        if (attempt == 0 and code != 0
+                and _EBTABLES_CHAIN_INIT_TRANSIENT in output):
+            log.warning(
+                "outer-container ebtables chain initialization was transient; "
+                "retrying the complete firewall install once")
+            continue
+        break
+    raise RSIEgressError(
+        f"outer-container firewall verification failed (exit {code}): "
+        f"{output[-1000:]}")
 
 
 def install_outer_firewall(

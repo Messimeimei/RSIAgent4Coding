@@ -485,7 +485,10 @@ class VM:
         if not isinstance(guest_path, str) or not guest_path:
             return False, "guest artifact path is empty"
 
-        docker_ip = self._docker_container_ip()
+        disable_direct = os.environ.get(
+            "RSIAGENT_DISABLE_DIRECT_DOCKER_PUSH", "").strip().lower() \
+            in {"1", "true", "yes", "on"}
+        docker_ip = "" if disable_direct else self._docker_container_ip()
         if docker_ip:
             last_reason = "direct stream did not run"
             for attempt in range(max(1, attempts)):

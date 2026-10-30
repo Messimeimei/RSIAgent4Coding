@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "run_name": "csi_task089_template",
+  "study_design": "target_conditioned_adaptation",
+  "task_release": "osworld-v2-2026.08.08",
+  "phase1": {
+    "distribution_file": "config/target_queries/task_089.md",
+    "project_budget": 8,
+    "checkpoints": [
+      0,
+      4,
+      8
+    ],
+    "parallel_waves": true,
+    "parallelism": 1,
+    "actor_config": "config/roles/actor.yaml",
+    "verifier_config": "config/roles/practice_verifier.yaml",
+    "verifier_control_config": "config/roles/target.yaml",
+    "curriculum_config": "custom_csi/task_089/curriculum.yaml",
+    "memory_config": "config/roles/actor.yaml",
+    "park_verified_branches": true
+  },
+  "phase2": {
+    "stop_policy": "curriculum_review",
+    "development_tasks": [
+      "task_089"
+    ],
+    "seed": 83089,
+    "target_config": "config/roles/target.yaml",
+    "practice_actor_config": "config/roles/actor.yaml",
+    "practice_verifier_config": "config/roles/verifier.yaml",
+    "curriculum_config": "custom_csi/task_089/curriculum.yaml",
+    "memory_config": "config/roles/actor.yaml"
+  },
+  "phase3": {
+    "held_out_tasks": [
+      "task_089"
+    ],
+    "held_out_environment_families": [],
+    "seed": 93089,
+    "config": "config/osworld/baseline.yaml",
+    "benchmark_lock": "custom_csi/task_089/evaluation.lock.json"
+  }
+}

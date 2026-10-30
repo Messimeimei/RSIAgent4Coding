@@ -157,6 +157,9 @@ def load_protocol(path: Path) -> dict[str, Any]:
     if not parallel_waves and parallelism != 1:
         raise ProtocolError(
             "phase1.parallelism must be 1 when parallel_waves is false")
+    parking = phase1.get("park_verified_branches", False)
+    if type(parking) is not bool or (parking and not parallel_waves):
+        raise ProtocolError("phase1.park_verified_branches requires parallel waves")
     distribution = _resolve_file(
         phase1.get("distribution_file"), label="phase1.distribution_file")
     distribution_text = distribution.read_text(encoding="utf-8")
@@ -416,6 +419,8 @@ def execute_phase1(spec: dict[str, Any], *, resume_completed_boundary=False) -> 
             "--parallel-waves", "--max-parallel",
             str(spec["phase1"]["parallelism"]),
         ]
+    if spec["phase1"].get("park_verified_branches", False):
+        command.insert(-2, "--park-verified-branches")
     if resolved["study_design"] == "target_conditioned_adaptation":
         command.insert(-2, "--target-query-conditioned")
     if resume_completed_boundary:
@@ -581,6 +586,11 @@ def execute_phase3(spec: dict[str, Any]) -> dict[str, Any]:
             ]
             environment = dict(os.environ)
             _configure_release_environment(spec, environment=environment)
+            # The Phase-3 config may intentionally use a protocol-selected lock
+            # instead of its sibling baseline lock (for example, a reviewed custom
+            # OpenAI-compatible transport). Bind the same lock in the child so
+            # task.py cannot silently rediscover a conflicting default route.
+            environment["RSIAGENT_BENCHMARK_LOCK"] = str(evaluator_lock)
             _run(command, run_root=run_root, phase="phase3", task=task,
                  environment=environment)
         result = _read_object(result_path)

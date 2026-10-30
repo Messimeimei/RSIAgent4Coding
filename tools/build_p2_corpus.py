@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """HOST-SIDE ONLY (grader-diagnostic class): build the P2 silent-audit corpus —
-8-gram shingles over all 108 task instructions. The corpus file is consumed
+8-gram shingles over all locked-release task instructions. The corpus is consumed
 exclusively by explore/commit.silent_audit (host process); it never enters any
-agent context, and run_explore.py never imports THIS module or task_loader.
+agent context. Task text is extracted statically so optional task dependencies and
+run-generated credentials cannot make the provenance manifest incomplete.
 """
 import hashlib
 import json
@@ -19,27 +20,22 @@ for p in (V2, RSIAGENT):
     sys.path.insert(0, p)
 os.chdir(V2)
 
-from task_loader import load_task_config, resolve_task_json_path   # noqa: E402
+from benchmarks.osworld.task_surface import load_public_task_surface  # noqa: E402
 from explore.commit import (CORPUS_NORMALIZATION, build_corpus,    # noqa: E402
                             normalize_instruction_for_corpus)
 
 OUT = os.path.join(RSIAGENT, "results", "explore", "corpus_shingles.json")
 
+lock = json.loads((Path(RSIAGENT) / "config/osworld/baseline.lock.json").read_text())
+task_count = int(lock["task_count"])
+website_host_suffix = str(lock["website"]["host_suffix"])
 instructions, missing = [], []
-for i in range(1, 121):
+for i in range(1, task_count + 1):
     tid = f"task_{i:03d}"
     try:
-        cf = resolve_task_json_path(task_id=tid, base_dir="evaluation_examples",
-                                    eval_version="v2")
-        tc = load_task_config(cf, task_id=tid, base_dir="evaluation_examples",
-                              eval_version="v2")
-        # Prefer a declared static base when present (026/041), then normalize
-        # the labeled run-generated credential line used by 057/072. Secrets
-        # are neither useful leakage shingles nor reproducible provenance.
-        ins = str(getattr(tc, "base_instruction", None)
-                  or getattr(tc, "instruction", None)
-                  or tc["instruction"])
-        instructions.append(normalize_instruction_for_corpus(ins))
+        surface = load_public_task_surface(
+            Path(V2), tid, website_host_suffix=website_host_suffix)
+        instructions.append(normalize_instruction_for_corpus(surface.instruction))
     except Exception:                                  # noqa: BLE001
         missing.append(tid)
 

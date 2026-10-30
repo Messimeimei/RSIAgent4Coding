@@ -1,9 +1,10 @@
-"""Minimal OpenRouter client with robust JSON and durable multimodal history.
+"""Minimal OpenAI-compatible client with robust JSON and durable image history.
 
 RSIAgent remains a code-as-policy agent. Native Look attachments are transported as
 exact image bytes and retained losslessly in the internal transcript so later turns
-and recovered processes receive the same observations. The key comes from
-``$OPENROUTER_API_KEY`` or a ``.env`` file.
+and recovered processes receive the same observations. OpenRouter remains the default
+transport. A secret-free route file may select another OpenAI-compatible endpoint and
+map the protocol's canonical model identities to endpoint-specific wire names.
 """
 import base64
 import hashlib
@@ -12,25 +13,100 @@ import logging
 import os
 import threading
 import time
+from types import SimpleNamespace
 
 from openai import APIConnectionError, APIError, APITimeoutError, OpenAI
 
-from config.runtime_paths import resolve_env_file
+from config.runtime_paths import resolve_env_file, resolve_path
+
+
+DEFAULT_ROUTE = {
+    "name": "openrouter",
+    "transport": "openai_compatible",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "model_map": {},
+    "supports_openrouter_provider_routing": True,
+    "supports_reasoning_controls": True,
+    "supports_reasoning_history": True,
+    "stream": False,
+}
+
+
+def _transport_route() -> dict:
+    """Resolve one secret-free transport route for the current process.
+
+    The route is intentionally selected through an environment variable so the
+    reviewed default remains byte-for-byte OpenRouter. Secrets are named, never
+    embedded, by the route file.
+    """
+    value = os.environ.get("RSIAGENT_LLM_ROUTE_FILE", "").strip()
+    if not value:
+        return dict(DEFAULT_ROUTE)
+    path = resolve_path(value)
+    try:
+        route = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read LLM route file: {path}") from exc
+    if not isinstance(route, dict):
+        raise RuntimeError(f"LLM route must be a JSON object: {path}")
+    required = ("name", "transport", "base_url", "api_key_env", "model_map")
+    missing = [name for name in required if route.get(name) in (None, "")]
+    if missing:
+        raise RuntimeError(f"LLM route is missing {missing}: {path}")
+    if route["transport"] != "openai_compatible":
+        raise RuntimeError(f"unsupported LLM transport {route['transport']!r}: {path}")
+    if not isinstance(route["model_map"], dict) or not all(
+            isinstance(k, str) and isinstance(v, str) and k and v
+            for k, v in route["model_map"].items()):
+        raise RuntimeError(f"LLM route model_map must contain string pairs: {path}")
+    reasoning_map = route.get("reasoning_effort_map", {})
+    if not isinstance(reasoning_map, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) and k and v
+            for k, v in reasoning_map.items()):
+        raise RuntimeError(
+            f"LLM route reasoning_effort_map must contain string pairs: {path}")
+    resolved = dict(DEFAULT_ROUTE)
+    resolved.update(route)
+    cap = resolved.get("max_output_tokens_cap")
+    if cap is not None and (type(cap) is not int or cap < 1):
+        raise RuntimeError(
+            f"LLM route max_output_tokens_cap must be a positive integer: {path}")
+    cap_map = resolved.get("max_output_tokens_map", {})
+    if not isinstance(cap_map, dict) or not all(
+            isinstance(k, str) and k and type(v) is int and v > 0
+            for k, v in cap_map.items()):
+        raise RuntimeError(
+            f"LLM route max_output_tokens_map must contain positive integers: {path}")
+    if type(resolved.get("stream")) is not bool:
+        raise RuntimeError(f"LLM route stream must be a boolean: {path}")
+    resolved["route_file"] = str(path)
+    return resolved
+
+
+def _env_secret(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    src = resolve_env_file()
+    try:
+        lines = src.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        key, separator, candidate = line.partition("=")
+        if separator and key.strip() == name:
+            return candidate.strip().strip("'\"")
+    return ""
 
 
 def _api_key() -> str:
-    k = os.environ.get("OPENROUTER_API_KEY", "")
-    if not k:
-        src = resolve_env_file()
-        try:
-            with src.open(encoding="utf-8") as handle:
-                for line in handle:
-                    if line.startswith("OPENROUTER_API_KEY="):
-                        k = line.split("=", 1)[1].strip()
-                        break
-        except FileNotFoundError:
-            pass
-    return k
+    return _env_secret(str(_transport_route()["api_key_env"]))
+
+
+def _wire_model(model: str, route: dict = None) -> str:
+    selected = route or _transport_route()
+    return str(selected["model_map"].get(model, model))
 
 
 _client = None
@@ -140,11 +216,14 @@ def with_durable_images(message: dict, attachments) -> dict:
     return result
 
 
-def _wire_message(message: dict) -> dict:
+def _wire_message(message: dict, *, include_reasoning: bool = True) -> dict:
     """Translate one internal history message into the provider wire schema."""
     result = dict(message)
     attachments = durable_images(result)
     result.pop(DURABLE_IMAGES_FIELD, None)
+    if not include_reasoning:
+        result.pop("reasoning", None)
+        result.pop("reasoning_content", None)
     if attachments:
         text = result.get("content", "")
         if not isinstance(text, str):
@@ -162,12 +241,15 @@ def _wire_message(message: dict) -> dict:
     return result
 
 
-def _request_messages(system: str, user: str, history=None, image=None) -> list:
+def _request_messages(system: str, user: str, history=None, image=None,
+                      *, include_reasoning: bool = True) -> list:
     """Construct the provider request, rehydrating every durable observation."""
     messages = [{"role": "system", "content": system}]
     if history:
-        messages.extend(_wire_message(message) for message in history)
-    messages.append(_wire_message(durable_user_message(user, image)))
+        messages.extend(_wire_message(
+            message, include_reasoning=include_reasoning) for message in history)
+    messages.append(_wire_message(
+        durable_user_message(user, image), include_reasoning=include_reasoning))
     return messages
 
 
@@ -272,8 +354,58 @@ def pop_last_reasoning() -> str:
 def _c() -> OpenAI:
     global _client
     if _client is None:
-        _client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=_api_key())
+        route = _transport_route()
+        _client = OpenAI(base_url=str(route["base_url"]), api_key=_api_key())
     return _client
+
+
+def _consume_stream(events):
+    """Collect one OpenAI-compatible chat stream into the non-streaming shape."""
+    content = []
+    reasoning = []
+    tool_calls = []
+    finish_reason = None
+    provider = None
+    usage = None
+    response_id = None
+    saw_choice = False
+    for event in events:
+        response_id = getattr(event, "id", None) or response_id
+        event_provider = getattr(event, "provider", None)
+        extra = getattr(event, "model_extra", None)
+        if not event_provider and isinstance(extra, dict):
+            event_provider = extra.get("provider") or extra.get("provider_name")
+        provider = event_provider or provider
+        usage = getattr(event, "usage", None) or usage
+        choices = getattr(event, "choices", None) or []
+        if not choices:
+            continue
+        saw_choice = True
+        choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            continue
+        value = getattr(delta, "content", None)
+        if isinstance(value, str):
+            content.append(value)
+        thought = (getattr(delta, "reasoning", None)
+                   or getattr(delta, "reasoning_content", None))
+        if isinstance(thought, str):
+            reasoning.append(thought)
+        calls = getattr(delta, "tool_calls", None) or []
+        tool_calls.extend(calls)
+    choices = []
+    if saw_choice:
+        message = SimpleNamespace(
+            content="".join(content), reasoning="".join(reasoning),
+            reasoning_content="".join(reasoning), tool_calls=tool_calls,
+            refusal=None)
+        choices = [SimpleNamespace(
+            finish_reason=finish_reason, message=message)]
+    return SimpleNamespace(
+        id=response_id, provider=provider, model_extra={}, error=None,
+        usage=usage, choices=choices)
 
 
 def chat(model: str, system: str, user: str,
@@ -296,7 +428,14 @@ def chat(model: str, system: str, user: str,
     its truncation recovery uses ``low``. None omits the field. ``provider_order`` is
     an optional OpenRouter route preference; when present, it is never silently dropped
     after an API error because that would change the frozen experiment mid-run."""
-    messages = _request_messages(system, user, history=history, image=image)
+    route = _transport_route()
+    wire_model = _wire_model(model, route)
+    token_cap = route.get("max_output_tokens_map", {}).get(
+        model, route.get("max_output_tokens_cap"))
+    wire_max_tokens = min(max_tokens, token_cap) if token_cap else max_tokens
+    messages = _request_messages(
+        system, user, history=history, image=image,
+        include_reasoning=bool(route["supports_reasoning_history"]))
     kwargs = {}
     if json_object:
         kwargs["response_format"] = {"type": "json_object"}
@@ -307,10 +446,15 @@ def chat(model: str, system: str, user: str,
         #                                            default, byte-identical to every
         #                                            run before 2026-08-09.
     extra_body = {}
-    if reasoning_effort:
-        extra_body["reasoning"] = ({"enabled": False} if reasoning_effort == "none"
-                                   else {"effort": reasoning_effort})  # effort inert on M3
-    elif reasoning_max_tokens:                     # v37 (: MAX reasoning, accuracy-only):
+    mapped_effort = route.get("reasoning_effort_map", {}).get(model)
+    effective_effort = mapped_effort or reasoning_effort
+    reasoning_enabled = bool(
+        route["supports_reasoning_controls"] or mapped_effort)
+    if effective_effort and reasoning_enabled:
+        extra_body["reasoning"] = (
+            {"enabled": False} if effective_effort == "none"
+            else {"effort": effective_effort})
+    elif reasoning_max_tokens and reasoning_enabled:
         extra_body["reasoning"] = {"max_tokens": int(reasoning_max_tokens)}
         # k3: reasoning is MANDATORY (enabled:false -> 400); depth IS tunable — this caps
         # thinking high instead of disabling. 0 = omit (GLM/M3 requests byte-identical).
@@ -321,7 +465,7 @@ def chat(model: str, system: str, user: str,
         order = list(order)
     else:
         order = []
-    if order:
+    if order and route["supports_openrouter_provider_routing"]:
         extra_body["provider"] = {
             "order": order,
             "allow_fallbacks": bool(provider_allow_fallbacks),
@@ -333,8 +477,12 @@ def chat(model: str, system: str, user: str,
     resp = None
     for attempt in range(4):                       # robust to TRANSIENT API errors (non-JSON body,
         try:                                       # 5xx, rate-limit): a flaky response must not kill a run
-            resp = _c().chat.completions.create(model=model, messages=messages,
-                                                max_tokens=max_tokens, temperature=temperature, **kwargs)
+            raw_response = _c().chat.completions.create(
+                model=wire_model, messages=messages,
+                max_tokens=wire_max_tokens, temperature=temperature,
+                stream=bool(route["stream"]), **kwargs)
+            resp = (_consume_stream(raw_response)
+                    if route["stream"] else raw_response)
             if (getattr(resp, "error", None)
                     or not getattr(resp, "choices", None)):
                 raise _CompletionResponseError(resp)
@@ -348,7 +496,8 @@ def chat(model: str, system: str, user: str,
                             "embedded_code=%s error_type=%s", model,
                             e.body["id"], e.body["provider"], e.status_code,
                             metadata.get("error_type") if isinstance(metadata, dict) else None)
-            if kwargs and not order and not isinstance(e, _CompletionResponseError):
+            if (kwargs and not order and not isinstance(e, _CompletionResponseError)
+                    and not route.get("strict_request_parameters", False)):
                 # A returned error/empty completion is not evidence that optional
                 # fields are unsupported. Preserve the exact request on its retry.
                 log.warning("%s erred with optional request fields (%s); dropping them "
@@ -374,7 +523,8 @@ def chat(model: str, system: str, user: str,
         cause = ValueError("response had no choices after retries")
         raise LLMTransportError(model, cause, recoverable=True,
                                 detail=str(cause)) from cause
-    provider = _response_provider(resp)
+    provider = _response_provider(
+        resp, fallback=f"{route['name']}:{wire_model}")
     model_counts = _PROVIDER_COUNTS.setdefault(model, {})
     model_counts[provider] = model_counts.get(provider, 0) + 1
     log.info("%s provider: %s", model, provider)
@@ -402,9 +552,13 @@ def chat(model: str, system: str, user: str,
                     model, len(native_calls), ", ".join(names))
     # Keep the thinking channel, including empty-content turns, associated with
     # this caller until its own run loop appends the complete assistant message.
-    _LAST_REASONING.value = getattr(choice.message, "reasoning", None) or ""
+    _LAST_REASONING.value = (getattr(choice.message, "reasoning", None)
+                             or getattr(choice.message, "reasoning_content", None)
+                             or "")
     if not txt.strip() and not truncated:          # v36.1: EMPTY-AT-STOP — the model ended
-        rsn = getattr(choice.message, "reasoning", None) or ""   # its turn inside the hidden
+        rsn = (getattr(choice.message, "reasoning", None)
+               or getattr(choice.message, "reasoning_content", None)
+               or "")   # its turn inside the hidden
         if rsn:                                    # channel. Log the tail for diagnosis
             log.warning("%s empty content at stop — reasoning tail: %r",   # (never execute
                         model, rsn[-300:])         # thinking; it holds rejected candidates)
@@ -427,19 +581,33 @@ def chat(model: str, system: str, user: str,
         why = "empty reply" if not txt else "program cut mid-stream"
         retry_tokens = (min(max_tokens * 2, retry_ceiling)
                         if mandatory_reasoning else max_tokens * 2)
+        retry_wire_tokens = (
+            min(retry_tokens, token_cap) if token_cap else retry_tokens)
         retry_effort = "low" if mandatory_reasoning else "none"
-        log.warning("%s truncated (%s at %d tokens) — retrying with %d + reasoning %s",
-                    model, why, max_tokens, retry_tokens, retry_effort)
-        return chat(model, system, user, max_tokens=retry_tokens,
-                    temperature=temperature, reasoning_effort=retry_effort,
-                    history=history, image=image,
-                    reasoning_max_tokens=reasoning_max_tokens, top_p=top_p,
-                    provider_order=order,
-                    provider_allow_fallbacks=provider_allow_fallbacks,
-                    provider_require_parameters=provider_require_parameters,
-                    json_object=json_object)
+        if retry_wire_tokens > wire_max_tokens:
+            log.warning(
+                "%s truncated (%s at %d tokens) — retrying with %d + "
+                "reasoning %s", model, why, wire_max_tokens,
+                retry_wire_tokens, retry_effort)
+            return chat(model, system, user, max_tokens=retry_tokens,
+                        temperature=temperature, reasoning_effort=retry_effort,
+                        history=history, image=image,
+                        reasoning_max_tokens=reasoning_max_tokens, top_p=top_p,
+                        provider_order=order,
+                        provider_allow_fallbacks=provider_allow_fallbacks,
+                        provider_require_parameters=provider_require_parameters,
+                        json_object=json_object)
+        if token_cap:
+            log.warning(
+                "%s truncated at the route's %d-token output cap; not "
+                "retrying an identical request", model, wire_max_tokens)
     if truncated:
         log.warning("%s hit the token limit; output may be cut", model)
+        if route.get("fail_on_truncation", False):
+            _LAST_REASONING.value = ""
+            detail = f"output truncated at {wire_max_tokens} tokens; no agent reply accepted"
+            raise LLMTransportError(
+                model, ValueError(detail), recoverable=False, detail=detail)
     return txt
 
 
@@ -454,7 +622,7 @@ def _reasoning_cannot_disable(model: str) -> bool:
         or model.startswith("moonshotai/kimi-k3-")
 
 
-def _response_provider(resp) -> str:
+def _response_provider(resp, *, fallback: str = "") -> str:
     """Extract OpenRouter's provider provenance without depending on SDK version."""
     value = getattr(resp, "provider", None)
     if not value:
@@ -468,7 +636,7 @@ def _response_provider(resp) -> str:
             dumped = {}
         if isinstance(dumped, dict):
             value = dumped.get("provider") or dumped.get("provider_name")
-    return str(value or "<unreported>")
+    return str(value or fallback or "<unreported>")
 
 
 def _looks_cut(txt: str) -> bool:

@@ -5,6 +5,7 @@
 # evaluator remains sealed until the Agent harness terminates.
 
 # Actor Agent: GLM-5.3 through OpenRouter, preferring Z.AI.
+# 这里我用 DeepSeek-V4-Pro 替换。
 model: z-ai/glm-5.3
 provider_order: [Z.AI]
 provider_allow_fallbacks: true

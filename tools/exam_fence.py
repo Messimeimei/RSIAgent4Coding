@@ -63,7 +63,11 @@ _APP_VOCAB = {"frame_rate_num", "frame_rate_den", "lift_gamma_gain",
               "fade_out", "gain_r", "gain_g", "gain_b", "mask_start",
               "warp_resource", "0.96",
               # Ordinary document-record columns, independent of task content.
-              "case_name", "pdf_url"}
+              "case_name", "pdf_url",
+              # Public OSWorld infrastructure and generic browser vocabulary.
+              # 5910 is the documented noVNC port and can also occur as a
+              # volatile Chrome PID in otherwise clean execution output.
+              "5910", "web page"}
 # Clock fragments ("02.000" from HH:MM:SS.mmm) are format artifacts, never
 # distinctive — excluded as a CLASS, not just the two observed instances.
 _CLOCK_FRAG = re.compile(r"^\d{2}\.\d{3}$")

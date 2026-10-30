@@ -64,6 +64,32 @@ def test_rsi_plan_preserves_latest_protocol_and_public_direction():
     ]
 
 
+def test_selected_tasks_keep_order_and_receive_task_specific_seeds():
+    plan = batch.build_plan(
+        "selected_tasks",
+        "both",
+        tasks=["task_044", "task_049", "task_065"],
+    )
+    assert [job["task"] for job in plan["jobs"]] == [
+        "task_044",
+        "task_049",
+        "task_065",
+    ]
+    for job in plan["jobs"]:
+        numeric = int(job["task"].rsplit("_", 1)[1])
+        assert job["protocol"]["phase2"]["seed"] == 83000 + numeric
+        assert job["protocol"]["phase3"]["seed"] == 93000 + numeric
+
+
+def test_task_selection_rejects_invalid_and_deduplicates():
+    assert batch.parse_tasks(["task_044,task_049", "task_044"]) == [
+        "task_044",
+        "task_049",
+    ]
+    with pytest.raises(ValueError, match="Invalid task id"):
+        batch.parse_tasks(["044"])
+
+
 def test_batch_stops_failed_lineage_and_continues_other_tasks(tmp_path, monkeypatch):
     jobs = [
         dict(task=name, commands=[[name, str(i)] for i in range(3)], result_paths=[])

@@ -10,6 +10,7 @@ from explore.target_isolation import (
     FORWARD_CHAIN,
     FilteringTcpGateway,
     INPUT_CHAIN,
+    L2_CHAIN,
     NAT_CHAIN,
     GatewayPorts,
     SealInstallation,
@@ -290,6 +291,16 @@ class _Container:
         return _ExecResult(self.exit_code, output)
 
 
+class _SequencedContainer:
+    def __init__(self, *results):
+        self.calls = []
+        self.results = list(results)
+
+    def exec_run(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+        return self.results.pop(0)
+
+
 def test_outer_firewall_install_uses_root_exec_and_binds_script_hash():
     container = _Container()
     digest = install_outer_firewall(
@@ -303,13 +314,49 @@ def test_outer_firewall_install_uses_root_exec_and_binds_script_hash():
 
 
 def test_outer_firewall_install_fails_closed_on_exec_or_marker_failure():
+    generic_failure = _Container(exit_code=1)
     with pytest.raises(RSIEgressError):
-        install_outer_firewall(_Container(exit_code=1), mode="null")
+        install_outer_firewall(generic_failure, mode="null")
+    assert len(generic_failure.calls) == 1
     with pytest.raises(RSIEgressError):
         install_outer_firewall(_Container(marker=False), mode="null")
     with pytest.raises(RSIEgressError):
         install_outer_firewall(
             _Container(ipv6_mode="unexpected-ip6-failure"), mode="null")
+
+
+def test_outer_firewall_retries_observed_ebtables_chain_transient_once():
+    transient = _ExecResult(
+        1, b"ebtables: No chain/target/match by that name\n")
+    success = _ExecResult(
+        0, b"RSI_EGRESS_IPV6_MODE=ip6tables-plus-ebtables\n"
+           b"RSI_EGRESS_SEAL_OK=null\n")
+    container = _SequencedContainer(transient, success)
+
+    digest = install_outer_firewall(container, mode="null")
+
+    assert len(digest) == 64
+    assert len(container.calls) == 2
+    assert container.calls[0] == container.calls[1]
+
+
+def test_outer_firewall_repeated_ebtables_chain_failure_stays_fail_closed():
+    transient = _ExecResult(
+        1, b"ebtables: No chain/target/match by that name\n")
+    container = _SequencedContainer(transient, transient)
+
+    with pytest.raises(RSIEgressError, match="No chain/target/match"):
+        install_outer_firewall(container, mode="null")
+
+    assert len(container.calls) == 2
+
+
+def test_ebtables_chain_creation_checks_existence_without_hiding_errors():
+    script = _firewall_script(mode="null")
+
+    assert f"if ! ebtables -L {L2_CHAIN} >/dev/null 2>&1; then" in script
+    assert f"  ebtables -N {L2_CHAIN}\nfi" in script
+    assert f"ebtables -N {L2_CHAIN} 2>/dev/null || true" not in script
 
 
 def test_real_image_missing_ip6_filter_has_narrow_ebtables_fallback():

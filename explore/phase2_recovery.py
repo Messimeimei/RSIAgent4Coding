@@ -56,7 +56,17 @@ class Phase2CurriculumRecovery:
     curriculum_memory_access: str = 'read_only'
     ready_target_cycles: int = 0
     post_target_learning: bool = False
+    resume_evolution_cycle: bool = False
     pending_memory_learning: object = None
+    recovery_kind: str = ''
+    evolution_artifact_offset: int = 0
+    failed_evolution_cycle: str = ''
+    failed_evolution_tree_sha256: str = ''
+    failed_runtime_log: str = ''
+    failed_runtime_log_sha256: str = ''
+    failed_practice_attempt: str = ''
+    failed_practice_attempt_tree_sha256: str = ''
+    recovery_plan_sha256: str = ''
 
     @classmethod
     def admit(cls, plan_path, root, configs, initial_memory, target, stop_policy):
@@ -70,6 +80,10 @@ class Phase2CurriculumRecovery:
             from explore.post_target_learning_recovery import admit_post_target_learning
             return admit_post_target_learning(
                 cls, plan_path, root, configs, initial_memory, target, stop_policy)
+        if plan.get('recovery_kind') == 'post_target_learning_zero_project_infra':
+            from explore.post_target_learning_recovery import admit_zero_project_infra
+            return admit_zero_project_infra(
+                cls, plan_path, root, configs, initial_memory, target, stop_policy)
         if plan.get('recovery_kind') == 'ready_target_replacement':
             from explore.ready_target_recovery import admit_ready_target_recovery
             return admit_ready_target_recovery(
@@ -77,6 +91,10 @@ class Phase2CurriculumRecovery:
         if plan.get('recovery_kind') == 'unverified_practice':
             from explore.practice_evidence_recovery import admit_practice_recovery
             return admit_practice_recovery(
+                cls, plan_path, root, configs, initial_memory, target, stop_policy)
+        if plan.get('recovery_kind') == 'post_target_learning_actor_infra_practice':
+            from explore.practice_actor_infra_recovery import admit_actor_infra_recovery
+            return admit_actor_infra_recovery(
                 cls, plan_path, root, configs, initial_memory, target, stop_policy)
         count = plan.get('completed_projects', 1)
         require(type(count) is int and count >= 1, 'invalid completed project count')

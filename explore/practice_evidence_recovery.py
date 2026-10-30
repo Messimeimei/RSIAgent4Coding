@@ -56,7 +56,7 @@ def run_practice_with_evidence(*, hooks, vm, lineage, episode_dir, project_index
     session = VerifierSession(saved.get('verifier_history', []))
     session.inspections = session.candidate_generation = int(saved.get('inspections', 0))
     findings = saved.get('findings', '')
-    candidate = Path(saved['candidate_dir']) if saved else None
+    candidate = Path(saved['candidate_dir']) if saved.get('candidate_dir') else None
     publication = int(saved.get('publication', 0))
     actor_used = int(saved.get('prior_actor_iters', 0))
     actor_wall = float(saved.get('prior_actor_wall_secs', 0))
@@ -93,10 +93,19 @@ def run_practice_with_evidence(*, hooks, vm, lineage, episode_dir, project_index
             V._push_canonical_memory(hooks, vm, str(memory_dir))
             prompt = V.self_evolving_actor_charter(
                 project, V._listing(before_memory), V.ACTOR_HANDOFF) + V._actor_runtime_contract()
+            recovery_observation = str(saved.get('recovery_observation', '')).strip()
+            if recovery_observation:
+                prompt += '\n\n' + recovery_observation
             evidence_requested = bool(findings)
             if evidence_requested:
                 prompt += '\n\n' + unverified_message(findings, evidence_request=True)
-            emit('ACTOR_EVIDENCE_REQUESTED' if evidence_requested else 'ACTOR_PHASE_STARTED',
+            actor_event = (
+                'ACTOR_EVIDENCE_REQUESTED' if evidence_requested else
+                'ACTOR_INFRA_RECOVERY_RESUMED'
+                if saved.get('resume_kind') == 'actor_infra' else
+                'ACTOR_PHASE_STARTED'
+            )
+            emit(actor_event,
                  status='in_progress', project_open=True, memory_phase_open=False,
                  payload={'project_index': project_index, 'actor_attempt': 1,
                           'verification_cycle': session.inspections,

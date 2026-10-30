@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from contextlib import contextmanager
@@ -25,10 +26,90 @@ from env.qemu_rollback import (
 )
 
 _PATCH_MARKER = "_rsiagent_checkpointable_provider_v1"
+_UPSTREAM_DOCKER_IMAGE = "happysixd/osworld-docker"
+_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_REPOSITORY_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*"
+_REPOSITORY_DIGEST = re.compile(
+    r"(?:(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)"
+    r"(?::[1-9][0-9]{0,4})?/)?"
+    rf"{_REPOSITORY_COMPONENT}(?:/{_REPOSITORY_COMPONENT})*"
+    r"@sha256:[0-9a-f]{64}\Z"
+)
 _READ_ONLY_OVMF = (
     "-drive if=pflash,format=raw,unit=0,readonly=on,"
     "file=/usr/share/OVMF/edk2-x86_64-code.fd"
 )
+_GUEST_BRIDGE = "dockerbridge"
+_GUEST_IPV4 = "20.20.20.21"
+_GUEST_BRIDGE_NAT_ATTEMPTS = 60
+
+
+def _validated_docker_image_override(value: str) -> str:
+    """Accept only immutable image IDs or lowercase repository digests."""
+
+    if not value:
+        return ""
+    if value != value.strip():
+        raise QemuRollbackError(
+            "RSIAGENT_DOCKER_IMAGE must not contain surrounding whitespace"
+        )
+    if _IMAGE_ID.fullmatch(value):
+        return value
+    if _REPOSITORY_DIGEST.fullmatch(value):
+        return value
+    raise QemuRollbackError(
+        "RSIAGENT_DOCKER_IMAGE must be sha256:<64 lowercase hex> or "
+        "a lowercase repository@sha256:<64 lowercase hex>"
+    )
+
+
+def _apply_docker_image_override(args, kwargs):
+    override = _validated_docker_image_override(
+        os.environ.get("RSIAGENT_DOCKER_IMAGE", "")
+    )
+    if not override:
+        return args, kwargs
+    if args and args[0] == _UPSTREAM_DOCKER_IMAGE:
+        return (override, *args[1:]), kwargs
+    if not args and kwargs.get("image") == _UPSTREAM_DOCKER_IMAGE:
+        return args, {**kwargs, "image": override}
+    return args, kwargs
+
+
+def _exec_result(result) -> tuple[int, bytes]:
+    if hasattr(result, "exit_code"):
+        return int(result.exit_code), bytes(result.output or b"")
+    exit_code, output = result
+    return int(exit_code), bytes(output or b"")
+
+
+def _ensure_guest_bridge_masquerade(container) -> None:
+    """SNAT host-published traffic before forwarding it to the QEMU guest."""
+
+    command = [
+        "sh", "-lc",
+        (
+            f"ip link show {_GUEST_BRIDGE} >/dev/null 2>&1 && "
+            f"(iptables -t nat -C POSTROUTING -o {_GUEST_BRIDGE} "
+            f"-d {_GUEST_IPV4}/32 -j MASQUERADE >/dev/null 2>&1 || "
+            f"iptables -t nat -I POSTROUTING 1 -o {_GUEST_BRIDGE} "
+            f"-d {_GUEST_IPV4}/32 -j MASQUERADE)"
+        ),
+    ]
+    last_output = b""
+    for _attempt in range(_GUEST_BRIDGE_NAT_ATTEMPTS):
+        exit_code, last_output = _exec_result(container.exec_run(command))
+        if exit_code == 0:
+            return
+        container.reload()
+        state = (container.attrs or {}).get("State", {})
+        if state and not state.get("Running", False):
+            break
+        time.sleep(0.5)
+    raise QemuRollbackError(
+        "failed to install QEMU guest bridge MASQUERADE rule: "
+        + last_output.decode("utf-8", "replace").strip()
+    )
 
 
 @contextmanager
@@ -54,7 +135,8 @@ def _boot_slot():
         time.sleep(0.5)
 
 
-def _prepare_boot_lifecycle(module):
+def _prepare_boot_lifecycle(
+        module, *, boot_timeout: int = 600, boot_attempts: int = 2) -> None:
     provider = module.DockerProvider
     start = getattr(provider, "start_emulator", None)
     if start is None or getattr(start, _PATCH_MARKER, False):
@@ -70,7 +152,7 @@ def _prepare_boot_lifecycle(module):
             return self._rsiagent_ports
         return used_ports(self)
 
-    def ready(self, timeout=600):
+    def ready(self, timeout=boot_timeout):
         try:
             return wait_ready(self, timeout=timeout)
         except TimeoutError as exc:
@@ -91,7 +173,7 @@ def _prepare_boot_lifecycle(module):
             raise
 
     def start_guarded(self, *args, **kwargs):
-        for attempt in range(2):
+        for attempt in range(boot_attempts):
             with _boot_slot():
                 self._rsiagent_allocating = True
                 self._rsiagent_ports = None
@@ -112,7 +194,7 @@ def _prepare_boot_lifecycle(module):
                             )
                         self.container = None
                     if not (
-                        attempt == 0
+                        attempt + 1 < boot_attempts
                         and isinstance(exc, TimeoutError)
                         and self._rsiagent_retryable_boot_timeout
                     ):
@@ -249,6 +331,7 @@ class _LoopbackContainers:
         return getattr(self._collection, name)
 
     def run(self, *args, **kwargs):
+        args, kwargs = _apply_docker_image_override(args, kwargs)
         owner = os.environ.get("RSIAGENT_VM_OWNER")
         if os.environ.get("RSIAGENT_DNSMASQ_START_RETRY") == "1":
             # A transient host inotify quota failure makes qemu-docker silently
@@ -282,9 +365,19 @@ class _LoopbackContainers:
                 port: ("127.0.0.1", binding) if isinstance(binding, int) else binding
                 for port, binding in ports.items()
             }
+        container = None
         try:
-            return self._collection.run(*args, **kwargs)
+            container = self._collection.run(*args, **kwargs)
+            ports = kwargs.get("ports") or {}
+            if 5000 in ports:
+                _ensure_guest_bridge_masquerade(container)
+            return container
         except Exception:
+            if container is not None:
+                try:
+                    container.remove(force=True, v=True)
+                except Exception:
+                    pass
             # Docker can create a container and then time out starting it before
             # returning its handle. The unique token identifies only this launch.
             if launch_token:
@@ -315,10 +408,16 @@ class _LoopbackClient:
         return _LoopbackContainers(self._client.containers)
 
 
-def prepare_checkpointable_docker_provider(mode: str | None) -> None:
+def prepare_checkpointable_docker_provider(
+        mode: str | None, *, boot_timeout: int = 600,
+        boot_attempts: int = 2) -> None:
     """Make future Docker guests checkpointable when mirror mode is selected."""
     if normalize_verifier_execution_mode(mode) != ROLLBACK_MIRROR:
         return
+    if type(boot_timeout) is not int or boot_timeout < 1:
+        raise ValueError("boot_timeout must be a positive integer")
+    if type(boot_attempts) is not int or boot_attempts not in {1, 2}:
+        raise ValueError("boot_attempts must be 1 or 2")
 
     from desktop_env.providers.docker import provider as provider_module
 
@@ -362,7 +461,11 @@ def prepare_checkpointable_docker_provider(mode: str | None) -> None:
     setattr(checkpointable_init, _PATCH_MARKER, True)
     setattr(checkpointable_init, "_rsiagent_original", current)
     DockerProvider.__init__ = checkpointable_init
-    _prepare_boot_lifecycle(provider_module)
+    _prepare_boot_lifecycle(
+        provider_module,
+        boot_timeout=boot_timeout,
+        boot_attempts=boot_attempts,
+    )
     if os.environ.get("RSIAGENT_TRUSTED_VERIFIER_TRANSPORT") == "virtio":
         from desktop_env.desktop_env import DesktopEnv
 

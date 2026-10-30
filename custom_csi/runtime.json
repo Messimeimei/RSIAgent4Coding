@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "base_outer_image": "happysixd/osworld-docker@sha256:0e6497a9295647cf05bf2b2af522fdd79bdeba2737595259cab310a3bcf6baa9",
+  "outer_image": "sha256:8b1c01c0c9f16771a0d4ce4a7582930fe6e581eef7bed73594c8c4e4b5e51eca",
+  "purpose": "legacy ebtables for fail-closed Phase-2 null-practice isolation",
+  "host_kernel_modules": [
+    "ebtables",
+    "ebtable_filter",
+    "ebt_ip6"
+  ]
+}

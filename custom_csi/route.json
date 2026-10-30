@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "name": "OpenCsiTool 模型路由",
+  "transport": "openai_compatible",
+  "base_url": "http://113.46.219.251:8080/v1",
+  "api_key_env": "CSI_API_KEY",
+  "model_map": {
+    "z-ai/glm-5.3": "DeepSeek-V4-Pro",
+    "moonshotai/kimi-k3": "Qwen3.8-Max"
+  },
+  "reasoning_effort_map": {},
+  "supports_openrouter_provider_routing": false,
+  "supports_reasoning_controls": false,
+  "supports_reasoning_history": false,
+  "stream": true,
+  "max_output_tokens_cap": 65536,
+  "max_output_tokens_map": {
+    "z-ai/glm-5.3": 65536,
+    "moonshotai/kimi-k3": 65536
+  },
+  "evaluator_min_output_tokens": 512,
+  "validation": {
+    "status": "requires_current_route_probe",
+    "long_agent_runs": false,
+    "note": "Historical smaller-budget receipts do not validate this 65536-token route. The runner probes actual request budgets before execution."
+  },
+  "role_routes": {
+    "actor_memory_target": {
+      "canonical_model": "z-ai/glm-5.3"
+    },
+    "verifier_visual_escalation": {
+      "canonical_model": "moonshotai/kimi-k3"
+    },
+    "curriculum": {
+      "canonical_model": "moonshotai/kimi-k3"
+    },
+    "sealed_evaluator": {
+      "wire_model": "Qwen3.8-Max"
+    },
+    "user_simulator": {
+      "wire_model": "Qwen3.8-Flash"
+    }
+  },
+  "strict_request_parameters": true,
+  "fail_on_truncation": true
+}

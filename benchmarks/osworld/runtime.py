@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -41,11 +42,60 @@ def _install_paths() -> None:
         if path not in sys.path:
             sys.path.insert(0, path)
     os.chdir(OSWORLD_ROOT)
+    _install_evaluator_token_floor()
 
 
-def _rsiagent_openrouter_key() -> str:
-    """Resolve the shared transport credential without exposing it in artifacts."""
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+def _install_evaluator_token_floor() -> int:
+    """Optionally raise tiny evaluator budgets for custom thinking models.
+
+    The released route leaves this unset. A custom runner may opt in when its
+    replacement evaluator otherwise spends a 10-token classification budget in a
+    hidden reasoning channel and returns no visible verdict.
+    """
+    raw = os.environ.get("RSIAGENT_EVAL_MIN_OUTPUT_TOKENS", "").strip()
+    if not raw:
+        return 0
+    try:
+        floor = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "RSIAGENT_EVAL_MIN_OUTPUT_TOKENS must be an integer") from exc
+    if floor < 1:
+        raise RuntimeError(
+            "RSIAGENT_EVAL_MIN_OUTPUT_TOKENS must be positive")
+
+    from desktop_env.evaluators import model_client
+
+    original = getattr(
+        model_client, "_rsiagent_original_generate_text",
+        model_client.generate_text)
+    if not hasattr(model_client, "_rsiagent_original_generate_text"):
+        model_client._rsiagent_original_generate_text = original
+
+    @wraps(original)
+    def generate_text(prompt, image_paths=None, options=None, **kwargs):
+        selected = dict(options or {})
+        value = selected.get(
+            "max_tokens", selected.get("max_output_tokens", 0))
+        try:
+            current = int(value or 0)
+        except (TypeError, ValueError):
+            current = 0
+        if current < floor:
+            selected["max_tokens"] = floor
+            selected.pop("max_output_tokens", None)
+        return original(
+            prompt, image_paths=image_paths, options=selected, **kwargs)
+
+    generate_text._rsiagent_min_output_tokens = floor
+    model_client.generate_text = generate_text
+    return floor
+
+
+def _rsiagent_transport_key(key_env: str = "OPENROUTER_API_KEY") -> str:
+    """Resolve a named transport credential without exposing it in artifacts."""
+    key_env = str(key_env or "OPENROUTER_API_KEY").strip()
+    key = os.environ.get(key_env, "").strip()
     if key:
         return key
     env_path = resolve_env_file(repo_root=RSIAGENT_ROOT)
@@ -55,9 +105,14 @@ def _rsiagent_openrouter_key() -> str:
         lines = []
     for line in lines:
         name, separator, value = line.partition("=")
-        if separator and name.strip() == "OPENROUTER_API_KEY":
+        if separator and name.strip() == key_env:
             return value.strip().strip("'\"")
     return ""
+
+
+def _rsiagent_openrouter_key() -> str:
+    """Backward-compatible wrapper for the default OpenRouter credential."""
+    return _rsiagent_transport_key("OPENROUTER_API_KEY")
 
 
 def _configure_sealed_evaluator(
@@ -96,20 +151,21 @@ def _configure_sealed_evaluator(
         raise RuntimeError(f"benchmark lock evaluator config is incomplete: {missing}")
     if evaluator["visibility"] != "sealed_after_actor_verifier_loop":
         raise RuntimeError("benchmark lock evaluator is not sealed after the loop")
-    key = _rsiagent_openrouter_key()
+    key_env = str(evaluator.get("api_key_env") or "OPENROUTER_API_KEY")
+    key = _rsiagent_transport_key(key_env)
     if not key:
         raise RuntimeError(
-            "sealed evaluator credential is absent: configure OPENROUTER_API_KEY"
+            f"sealed evaluator credential is absent: configure {key_env}"
         )
 
     # Assign, rather than setdefault, so a stale interactive shell cannot silently
     # drift a release-bound experiment away from its reviewed evaluator config.
-    os.environ["OPENROUTER_API_KEY"] = key
+    os.environ[key_env] = key
     os.environ["WEBSITE_HOST_SUFFIX"] = str(evaluator["website_host_suffix"])
     os.environ["OSWORLD_EVAL_MODEL_PROVIDER"] = str(evaluator["provider"])
     os.environ["OSWORLD_EVAL_MODEL_NAME"] = str(evaluator["model"])
     os.environ["OSWORLD_EVAL_MODEL_BASE_URL"] = str(evaluator["base_url"])
-    os.environ["OSWORLD_EVAL_MODEL_API_KEY_ENV"] = "OPENROUTER_API_KEY"
+    os.environ["OSWORLD_EVAL_MODEL_API_KEY_ENV"] = key_env
     os.environ["OSWORLD_EVAL_MODEL_RETRY_ATTEMPTS"] = str(evaluator["retry_attempts"])
     os.environ["OSWORLD_EVAL_MODEL_RETRY_DELAY"] = str(evaluator["retry_delay_seconds"])
     return {
@@ -118,6 +174,7 @@ def _configure_sealed_evaluator(
         "provider": str(evaluator["provider"]),
         "model": str(evaluator["model"]),
         "base_url": str(evaluator["base_url"]),
+        "api_key_env": key_env,
         "retry_attempts": int(evaluator["retry_attempts"]),
         "retry_delay_seconds": float(evaluator["retry_delay_seconds"]),
         "visibility": str(evaluator["visibility"]),
@@ -127,12 +184,16 @@ def _configure_sealed_evaluator(
 
 def _probe_sealed_evaluator_transport() -> dict[str, str]:
     """Make one task-independent authentication probe before Actor work."""
+    _install_evaluator_token_floor()
     from desktop_env.evaluators.model_client import generate_text
 
     response = str(
         generate_text(
             "Evaluator transport preflight only. Reply exactly READY.",
-            options={"max_tokens": 8, "temperature": 0.0},
+            # Thinking-capable OpenAI-compatible models may spend a tiny budget
+            # entirely in their hidden reasoning channel and return empty visible
+            # text. This remains a minimal authentication probe, not evaluation.
+            options={"max_tokens": 64, "temperature": 0.0},
         )
     ).strip()
     if not response:

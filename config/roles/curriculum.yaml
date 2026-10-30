@@ -40,3 +40,7 @@ escalation_model: ""
 max_resumes: 0
 action_discipline: true
 cycle_evidence: true
+
+
+# 也加入一个限制超长输入的，防止报错
+trace_context_max_chars: 500000

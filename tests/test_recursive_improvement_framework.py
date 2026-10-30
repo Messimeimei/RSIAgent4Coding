@@ -300,3 +300,34 @@ def test_learning_entrypoints_do_not_call_official_evaluator():
     # or serializes an evaluator object itself.
     assert ".evaluate(" not in orchestrator
     assert "task_loader" not in orchestrator
+
+
+def test_parked_wave_options_reach_phase1_child(tmp_path, monkeypatch):
+    from benchmarks.osworld.phase1 import _parser
+    path = _spec(tmp_path)
+    value = json.loads(path.read_text())
+    value["phase1"].update(parallel_waves=True, parallelism=1, park_verified_branches=True)
+    path.write_text(json.dumps(value))
+    monkeypatch.setattr(protocol, "RESULTS_ROOT", tmp_path / "results")
+    spec = protocol.load_protocol(path)
+    seen = []
+
+    def launch(argv, **kwargs):
+        parsed = _parser().parse_args(argv[3:])
+        seen.append(parsed)
+        protocol._write_json_atomic(spec["_resolved"]["run_root"] / "phase1/result.json",
+                                    {"status": "budget_exhausted", "official_evaluator_calls": 0})
+
+    monkeypatch.setattr(protocol, "_run", launch)
+    protocol.execute_phase1(spec)
+    assert seen[0].parallel_waves and seen[0].park_verified_branches
+    assert seen[0].max_parallel == 1
+
+
+def test_parking_requires_wave_protocol(tmp_path):
+    path = _spec(tmp_path)
+    value = json.loads(path.read_text())
+    value["phase1"].update(parallel_waves=False, parallelism=1, park_verified_branches=True)
+    path.write_text(json.dumps(value))
+    with pytest.raises(protocol.ProtocolError, match="park_verified_branches"):
+        protocol.load_protocol(path)

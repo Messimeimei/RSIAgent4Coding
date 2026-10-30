@@ -348,6 +348,95 @@ def phase2_protocol_metadata(
     }
 
 
+def _evolution_artifact_index(recovery, semantic_index: int) -> int:
+    """Map semantic evolution numbering onto preserved artifact directories."""
+    offset = int(getattr(recovery, "evolution_artifact_offset", 0) or 0)
+    if semantic_index < 1 or offset < 0:
+        raise RuntimeError("invalid evolution recovery offset")
+    return semantic_index + offset
+
+
+def _evolution_resume_boundary(recovery, semantic_index: int):
+    """Return the one admitted in-cycle boundary, if this is its wave."""
+    if recovery is None or semantic_index != 1:
+        return None
+    if not getattr(recovery, "post_target_learning", False):
+        return recovery
+    if getattr(recovery, "resume_evolution_cycle", False):
+        return recovery
+    return None
+
+
+def _recovery_result_record(recovery) -> dict[str, Any]:
+    """Return secret-free provenance for preflight and final Phase-2 results."""
+    offset = int(getattr(recovery, "evolution_artifact_offset", 0) or 0)
+    failed = str(getattr(recovery, "failed_evolution_cycle", "") or "")
+    failed_tree = str(
+        getattr(recovery, "failed_evolution_tree_sha256", "") or "")
+    failed_log = str(getattr(recovery, "failed_runtime_log", "") or "")
+    failed_log_sha256 = str(
+        getattr(recovery, "failed_runtime_log_sha256", "") or "")
+    failed_practice = str(
+        getattr(recovery, "failed_practice_attempt", "") or "")
+    failed_practice_tree = str(
+        getattr(recovery, "failed_practice_attempt_tree_sha256", "") or "")
+    observed_plan_sha256 = _sha256_file(Path(recovery.plan_path))
+    expected_plan_sha256 = str(
+        getattr(recovery, "recovery_plan_sha256", "") or
+        observed_plan_sha256)
+    if observed_plan_sha256 != expected_plan_sha256:
+        raise RuntimeError("recovery plan changed after admission")
+    if failed:
+        from explore.post_target_learning_recovery import _artifact_tree_sha256
+
+        if not failed_tree or _artifact_tree_sha256(failed) != failed_tree:
+            raise RuntimeError("failed evolution evidence changed after admission")
+    if failed_log:
+        if (not failed_log_sha256
+                or _sha256_file(Path(failed_log)) != failed_log_sha256):
+            raise RuntimeError("failed runtime log changed after admission")
+    if failed_practice:
+        from explore.post_target_learning_recovery import _artifact_tree_sha256
+
+        if (not failed_practice_tree
+                or _artifact_tree_sha256(failed_practice)
+                != failed_practice_tree):
+            raise RuntimeError(
+                "failed practice Actor evidence changed after admission")
+    return {
+        "kind": str(getattr(recovery, "recovery_kind", "") or ""),
+        "plan": str(recovery.plan_path),
+        "plan_sha256": expected_plan_sha256,
+        "completed_target_actor_replayed": False,
+        "completed_target_verifier_replayed": False,
+        "completed_target_learning_replayed": False,
+        "failed_evolution_cycle": failed,
+        "failed_evolution_tree_sha256": failed_tree,
+        "failed_evolution_cycle_preserved": bool(failed and failed_tree),
+        "failed_runtime_log": failed_log,
+        "failed_runtime_log_sha256": failed_log_sha256,
+        "failed_practice_attempt": failed_practice,
+        "failed_practice_attempt_tree_sha256": failed_practice_tree,
+        "completed_practice_projects_before_recovery": int(
+            getattr(recovery, "projects", 0) or 0),
+        "completed_curriculum_turns_before_recovery": int(
+            getattr(recovery, "completed_curriculum_turns", 0) or 0),
+        "first_recovery_evolution_artifact_cycle": 1 + offset,
+        "target_learning_updates_scope": "lineage_total",
+        "pre_recovery_llm_provider_counts": "external_not_aggregated",
+    }
+
+
+def _initial_target_learning_updates(recovery) -> int:
+    """Restore the committed target-learning count for the whole lineage."""
+    return 1 if recovery is not None else 0
+
+
+def _resolve_recovery_plan_path(value) -> Path:
+    """Resolve a CLI recovery plan against RSIAgent after changing directory."""
+    return resolve_path(value, repo_root=RSIAGENT_ROOT).resolve(strict=True)
+
+
 def _parser() -> argparse.ArgumentParser:
     from core.self_evolving_loop import Phase2StopPolicy
 
@@ -390,8 +479,33 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--protocol-run", default="", help="safe experiment lineage name for Phase 2"
     )
+    parser.add_argument(
+        "--recovery-plan",
+        default="",
+        help=("strict infrastructure-recovery plan; admission verifies all "
+              "completed boundaries before any model call"),
+    )
+    parser.add_argument(
+        "--failed-runtime-log",
+        default="",
+        help=("runtime log that recorded the allowlisted infrastructure fault; "
+              "required only when printing a zero-project recovery plan"),
+    )
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--preflight", action="store_true")
+    action.add_argument(
+        "--print-zero-project-recovery-plan",
+        action="store_true",
+        help=("print a secret-free candidate plan for the exact committed-PASS, "
+              "zero-project ebtables failure boundary; makes no changes"),
+    )
+    action.add_argument(
+        "--print-actor-infra-recovery-plan",
+        action="store_true",
+        help=("print a secret-free candidate plan for a committed practice "
+              "followed by an open practice whose Actor terminated the guest "
+              "controller; makes no changes"),
+    )
     action.add_argument(
         "--execute",
         default="",
@@ -403,21 +517,41 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None, *, recovery_plan=None) -> int:
     args = _parser().parse_args(argv)
     _install_paths()
-    args.phase2_stop_policy = args.phase2_stop_policy or DEFAULT_PHASE2_STOP_POLICY
-    args.phase2_curriculum_memory_access = (
-        args.phase2_curriculum_memory_access or "read_only"
-    )
-    if recovery_plan is not None:
+    cli_recovery_plan = str(args.recovery_plan or "").strip()
+    if recovery_plan is not None and cli_recovery_plan:
+        raise RuntimeError("recovery plan was supplied by both CLI and caller")
+    selected_recovery_plan = cli_recovery_plan or recovery_plan
+    if ((args.print_zero_project_recovery_plan
+         or args.print_actor_infra_recovery_plan)
+            and selected_recovery_plan is not None):
+        raise RuntimeError(
+            "a recovery-plan printer cannot consume --recovery-plan")
+    if args.failed_runtime_log and not args.print_zero_project_recovery_plan:
+        raise RuntimeError(
+            "--failed-runtime-log requires --print-zero-project-recovery-plan")
+    if selected_recovery_plan is not None:
         try:
-            declared_access = json.loads(Path(recovery_plan).read_text()).get(
-                "curriculum_memory_access", "read_only"
-            )
+            selected_recovery_plan = str(
+                _resolve_recovery_plan_path(selected_recovery_plan))
+            plan_header = json.loads(Path(selected_recovery_plan).read_text())
+            if not isinstance(plan_header, dict):
+                raise TypeError("recovery plan must be a JSON object")
+            declared_access = plan_header.get(
+                "curriculum_memory_access", "read_only")
         except (OSError, TypeError, ValueError) as exc:
             raise RuntimeError(
                 "memory-access ablations require a fresh Phase-2 lineage or a valid condition-preserving recovery plan"
             ) from exc
-        if args.phase2_curriculum_memory_access != declared_access:
+    args.phase2_stop_policy = args.phase2_stop_policy or DEFAULT_PHASE2_STOP_POLICY
+    if selected_recovery_plan is not None:
+        if args.phase2_curriculum_memory_access is None:
+            args.phase2_curriculum_memory_access = declared_access
+        elif args.phase2_curriculum_memory_access != declared_access:
             raise RuntimeError("recovery cannot change Curriculum memory access")
+    else:
+        args.phase2_curriculum_memory_access = (
+            args.phase2_curriculum_memory_access or "read_only"
+        )
     if args.target_config is None:
         args.target_config = str(DEFAULT_PHASE2_TARGET_CONFIG)
     if not args.protocol_run:
@@ -503,25 +637,52 @@ def main(argv: list[str] | None = None, *, recovery_plan=None) -> int:
         "official_evaluator_calls_after_loop": 0,
         "benchmark_profile": benchmark_provenance["profile"],
         "task_release": benchmark_provenance["task_release"],
+        "recovery_plan": selected_recovery_plan,
     }
-    if args.preflight:
-        print(json.dumps(preflight, indent=2, sort_keys=True))
+    if args.print_zero_project_recovery_plan:
+        from explore.post_target_learning_recovery import (
+            build_zero_project_infra_plan,
+        )
+
+        if not args.failed_runtime_log:
+            raise RuntimeError(
+                "--print-zero-project-recovery-plan requires "
+                "--failed-runtime-log")
+        failed_runtime_log = resolve_path(
+            args.failed_runtime_log, repo_root=RSIAGENT_ROOT)
+        print(json.dumps(build_zero_project_infra_plan(
+            root, args.phase2_curriculum_memory_access,
+            failed_runtime_log), indent=2, sort_keys=True))
         return 0
-    expected_ack = PHASE2_EXECUTE_ACK
-    if args.execute != expected_ack:
-        raise RuntimeError(f"--execute must equal {expected_ack}")
+    if args.print_actor_infra_recovery_plan:
+        from explore.practice_actor_infra_recovery import (
+            build_actor_infra_recovery_plan,
+        )
+
+        print(json.dumps(build_actor_infra_recovery_plan(
+            root, args.phase2_curriculum_memory_access),
+            indent=2, sort_keys=True))
+        return 0
     recovery = None
-    if recovery_plan is not None:
+    if selected_recovery_plan is not None:
         from explore.phase2_recovery import Phase2CurriculumRecovery
 
         recovery = Phase2CurriculumRecovery.admit(
-            recovery_plan,
+            selected_recovery_plan,
             root,
             configs,
             initial_memory,
             target_direction,
             args.phase2_stop_policy,
         )
+        preflight["recovery"] = _recovery_result_record(recovery)
+        preflight["recovery"]["status"] = "admitted"
+    if args.preflight:
+        print(json.dumps(preflight, indent=2, sort_keys=True))
+        return 0
+    expected_ack = PHASE2_EXECUTE_ACK
+    if args.execute != expected_ack:
+        raise RuntimeError(f"--execute must equal {expected_ack}")
     if recovery is None and root.exists() and any(root.iterdir()):
         raise RuntimeError(
             "self-evolving result root is nonempty; preserve it and use a new locked retry tag"
@@ -584,12 +745,14 @@ def main(argv: list[str] | None = None, *, recovery_plan=None) -> int:
     if recovery is None:
         _atomic_install_memory(str(active_memory_dir), initial_memory)
     curriculum_session = UnifiedCurriculumSession()
-    counters = {"target_learning": 0, "target_orientations": 0}
+    counters = {
+        "target_learning": _initial_target_learning_updates(recovery),
+        "target_orientations": 0,
+    }
     if recovery is not None:
         curriculum_session.history = recovery.history
         curriculum_session.notes = recovery.notes
         curriculum_session.turns = recovery.completed_curriculum_turns
-        counters["target_learning"] = 1
         if recovery.ready_target_cycles:
             curriculum_session.waves = 1
             curriculum_session.project_summaries = [
@@ -1088,7 +1251,8 @@ def main(argv: list[str] | None = None, *, recovery_plan=None) -> int:
         from benchmarks.osworld.setup import _boot_vm, _close, _reset_null_vm_sealed
         from explore.target_isolation import TargetIsolationSeal
 
-        cycle_root = root / "evolution_cycles" / f"cycle_{evolution_index:03d}"
+        artifact_index = _evolution_artifact_index(recovery, evolution_index)
+        cycle_root = root / "evolution_cycles" / f"cycle_{artifact_index:03d}"
         (practice_environment, practice_vm) = _boot_vm()
         egress_seal = TargetIsolationSeal()
         try:
@@ -1097,12 +1261,8 @@ def main(argv: list[str] | None = None, *, recovery_plan=None) -> int:
                     active_vm, target, egress_seal
                 )
             )
-            current_recovery = (
-                recovery
-                if evolution_index == 1
-                and (not getattr(recovery, "post_target_learning", False))
-                else None
-            )
+            current_recovery = _evolution_resume_boundary(
+                recovery, evolution_index)
             if current_recovery is not None:
                 practice_hooks = dataclasses.replace(
                     practice_hooks,
@@ -1185,7 +1345,13 @@ def main(argv: list[str] | None = None, *, recovery_plan=None) -> int:
                 "target_cycle": 1,
                 "recovery_plan": str(recovery.plan_path),
                 "completed_target_learning_replayed": False,
-                "curriculum_calls_before_recovery": 0,
+                "curriculum_calls_before_recovery": int(
+                    recovery.completed_curriculum_turns),
+                "completed_practice_projects_before_recovery": int(
+                    recovery.projects),
+                "failed_evolution_cycle": recovery.failed_evolution_cycle,
+                "first_recovery_evolution_artifact_cycle":
+                    _evolution_artifact_index(recovery, 1),
             },
         )
         loop_result = continue_after_target_learning(
@@ -1288,6 +1454,9 @@ def main(argv: list[str] | None = None, *, recovery_plan=None) -> int:
         if recovery is not None:
             payload["infrastructure_recovery"] = str(recovery.plan_path)
             payload["llm_provider_counts_scope"] = "recovery_process_only"
+            payload["recovery"] = _recovery_result_record(recovery)
+            payload["target_learning_updates_scope"] = (
+                payload["recovery"]["target_learning_updates_scope"])
         _write_json_atomic(root / "result.json", payload)
         print("\n=== PHASE 2 RESULT " + json.dumps(payload, sort_keys=True))
         return 2 if loop_result.termination == "target_harness_unverified" else 0

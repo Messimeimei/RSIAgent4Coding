@@ -55,6 +55,15 @@ def test_document_schema_fields_are_not_answers_even_in_old_cache(tmp_path):
     assert fence.audit_transcripts(str(tmp_path)) == []
 
 
+def test_public_vnc_port_and_generic_browser_phrase_are_not_a_tuple(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(fence, "_load_constants", lambda: {
+        "036": ["5910", "web page"],
+    })
+    record(tmp_path, "debug Chrome PID 5910 while checking the web page")
+    assert fence.audit_transcripts(str(tmp_path)) == []
+
+
 @pytest.mark.parametrize("output", [
     "/home/ubuntu/OSWorld-V2/evaluation_examples/task_class/task_011.py",
     "/home/ubuntu/OSWorld-V2/desktop_env/evaluators/metrics.py",

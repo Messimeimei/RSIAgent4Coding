@@ -22,17 +22,30 @@ LOCK = ROOT / "config/osworld/baseline.lock.json"
 TEMPLATE = ROOT / "config/osworld/rsi.example.json"
 
 
+def parse_tasks(values):
+    if values is None or values == ["all"]:
+        lock = json.loads(LOCK.read_text())
+        return [f"task_{i:03d}" for i in range(1, lock["task_count"] + 1)]
+    tasks = []
+    for value in values:
+        for task in value.split(","):
+            task = task.strip()
+            if not re.fullmatch(r"task_\d{3}", task):
+                raise ValueError(f"Invalid task id: {task!r}")
+            if task not in tasks:
+                tasks.append(task)
+    if not tasks:
+        raise ValueError("At least one task is required")
+    return tasks
+
+
 def build_plan(name, arm, *, tasks=None, osworld_root=None):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
         raise ValueError(
             "Batch name must contain 1–64 letters, numbers, underscores or hyphens"
         )
     lock = json.loads(LOCK.read_text())
-    tasks = (
-        tasks
-        if tasks is not None
-        else [f"task_{i:03d}" for i in range(1, lock["task_count"] + 1)]
-    )
+    tasks = parse_tasks(tasks)
     osworld_root = osworld_root or resolve_osworld_root()
     folder = ROOT / "results/batches" / name
     jobs = []
@@ -72,8 +85,11 @@ def build_plan(name, arm, *, tasks=None, osworld_root=None):
                 )
             )
             spec["phase1"]["distribution_file"] = str(folder / task / "direction.md")
+            numeric = int(task.rsplit("_", 1)[1])
             spec["phase2"]["development_tasks"] = [task]
+            spec["phase2"]["seed"] = 83000 + numeric
             spec["phase3"]["held_out_tasks"] = [task]
+            spec["phase3"]["seed"] = 93000 + numeric
             job.update(protocol=spec, direction=instruction)
             job["result_paths"].append(
                 str(ROOT / "results/recursive_improvement" / spec["run_name"])
@@ -197,6 +213,12 @@ def main(argv=None):
         help="Concurrent task lineages; each RSI lineage may own multiple VMs",
     )
     parser.add_argument(
+        "--tasks",
+        nargs="+",
+        default=["all"],
+        help="Task IDs such as task_044; defaults to the full release",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the full plan without launching or writing outputs",
@@ -205,7 +227,9 @@ def main(argv=None):
     if args.concurrency < 1:
         parser.error("--concurrency must be positive")
     osworld_root = resolve_osworld_root()
-    plan = build_plan(args.name, args.arm, osworld_root=osworld_root)
+    plan = build_plan(
+        args.name, args.arm, tasks=args.tasks, osworld_root=osworld_root
+    )
     if args.dry_run:
         print(json.dumps(plan, indent=2))
         return 0

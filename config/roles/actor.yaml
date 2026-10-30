@@ -3,6 +3,8 @@
 # The target and practice seats use the same GLM-5.3 Actor identity so durable
 # memory is learned by the model that must transfer it back to the target. Numeric
 # limits are emergency watchdogs, not semantic stopping criteria.
+# 添加了 trace_context_max_chars 参数，用于控制输入模型的上下文长度，防止程序一次打印太多内容
+# 运行中有一次报错发生了给出了 340 多万，这里限制到 50 万。
 model: z-ai/glm-5.3
 provider_order:
   - Z.AI
@@ -41,3 +43,4 @@ max_resumes: 0
 action_discipline: true
 cycle_evidence: true
 commit_frac: 1.0
+trace_context_max_chars: 500000

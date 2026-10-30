@@ -438,6 +438,29 @@ def test_vm_push_file_prefers_verified_direct_stream_on_docker(
         str(source), "/tmp/candidate.tgz", "172.17.0.42", 3600)]
 
 
+def test_vm_push_file_can_force_controller_fallback_on_docker(
+        tmp_path, monkeypatch):
+    source = tmp_path / "candidate.tgz"
+    source.write_bytes(b"candidate bytes")
+    controller = SimpleNamespace(http_server="http://controller.invalid")
+    vm = RSIAgentVM(SimpleNamespace(
+        provider_name="docker", provider=SimpleNamespace(),
+        controller=controller))
+    calls = []
+    monkeypatch.setenv("RSIAGENT_DISABLE_DIRECT_DOCKER_PUSH", "1")
+    monkeypatch.setattr(
+        vm, "_docker_container_ip",
+        lambda: pytest.fail("direct Docker route was inspected"))
+    monkeypatch.setattr(
+        vm, "_push_file_multipart",
+        lambda local, guest, attempts, timeout:
+            calls.append((local, guest, attempts, timeout)) or (True, ""))
+
+    assert vm.push_file(str(source), "/tmp/candidate.tgz") == (True, "")
+    assert calls == [(
+        str(source), "/tmp/candidate.tgz", 3, 3600)]
+
+
 def test_direct_stream_stages_atomic_part_on_destination_filesystem():
     from env.vm import _atomic_guest_part_path
 

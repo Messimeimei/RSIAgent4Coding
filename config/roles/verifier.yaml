@@ -46,3 +46,6 @@ vision_model_2: ""
 practice_mode: true
 independent_verify: false
 verifier_model: ""
+
+# 也加入一个限制超长输入的，之前有报错
+trace_context_max_chars: 500000

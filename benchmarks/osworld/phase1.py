@@ -199,6 +199,9 @@ def _parser() -> argparse.ArgumentParser:
         "--max-parallel", type=int, default=4,
         help=("host scheduling capacity for a Curriculum-authored wave; this "
               "does not prescribe or truncate the wave width"))
+    parser.add_argument(
+        "--park-verified-branches", action="store_true",
+        help="release verified branch VMs and restore their candidates for ordered commits")
     parser.add_argument("--actor-config", default=str(DEFAULT_ACTOR_CONFIG))
     parser.add_argument("--verifier-config", default=str(DEFAULT_VERIFIER_CONFIG))
     parser.add_argument(
@@ -254,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         "wave_width_agent_owned": args.parallel_waves,
         "branch_memory_snapshot_isolated": args.parallel_waves,
         "memory_writes_serialized": args.parallel_waves,
+        "park_verified_branches": args.park_verified_branches,
         "curriculum_may_stop_early": True,
         "curriculum_terminal_token": "SATURATED",
         "actor_agent": configs["actor"].model,
@@ -351,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
             project_budget=args.project_budget,
             checkpoint_projects=checkpoints,
             max_parallel=args.max_parallel,
+            park_verified_branches=args.park_verified_branches,
             target_query_conditioned=args.target_query_conditioned,
             resume_completed_boundary=args.resume_completed_boundary)
     else:

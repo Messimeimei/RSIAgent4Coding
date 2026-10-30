@@ -1,0 +1,5 @@
+# 不上传 env 文件
+
+.env
+__pycache__/
+*.pyc
