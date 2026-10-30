@@ -36,3 +36,6 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# 忽略宿主机的备份配置
+runtime.json.local-original
