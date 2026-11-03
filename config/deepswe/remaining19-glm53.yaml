@@ -1,0 +1,83 @@
+# Remaining tasks from the requested 20-task batch; dateutil is already evaluated.
+jobs_dir: results/deepswe/jobs
+job_name: bitfun-remaining19-glm53-20261102-01
+n_attempts: 1
+n_concurrent_trials: 1
+timeout_multiplier: 1
+agent_timeout_multiplier: 1
+verifier_timeout_multiplier: 1
+environment_build_timeout_multiplier: 1
+retry:
+  max_retries: 0
+environment:
+  type: docker
+  import_path: benchmarks.deepswe.docker_environment:BitfunDockerEnvironment
+  kwargs:
+    inference_ports: [8080]
+  force_build: false
+  delete: true
+  cpu_enforcement_policy: limit
+  memory_enforcement_policy: limit
+  mounts:
+    - type: bind
+      source: .runtime/deepswe/bin/uv
+      target: /usr/local/bin/uv
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: .runtime/deepswe/bin/bitfun
+      target: /usr/local/bin/bitfun
+      read_only: true
+      bind:
+        create_host_path: false
+agents:
+  - name: bitfun-cli
+    import_path: benchmarks.deepswe.bitfun_agent:BitfunCli
+    model_name: GLM-5.3
+    kwargs:
+      binary_path: /usr/local/bin/bitfun
+      output_patch_path: null
+      bitfun_config:
+        app:
+          logging:
+            model_exchange_tracing:
+              mode: full
+        ai:
+          models:
+            - id: GLM-5.3
+              name: GLM-5.3
+              provider: openai
+              model_name: GLM-5.3
+              base_url: http://113.46.219.251:8080/v1
+              api_key: ${API_KEY}
+              enabled: true
+              context_window: 1048576
+              max_tokens: 65536
+              reasoning_mode: enabled
+              reasoning_effort: max
+          default_models:
+            primary: GLM-5.3
+            fast: GLM-5.3
+datasets:
+  - path: ../DeepSWE/tasks
+    task_names:
+      - dynamodb-toolbox-lazy-recursive-schemas
+      - expr-try-catch-errors
+      - fastapi-implicit-head-options
+      - kcp-go-multiplexed-kcp-streams
+      - kgateway-consistent-hash-policy
+      - kombu-virtual-queue-dead-lettering
+      - koota-pair-relation-tracking
+      - koota-query-predicates
+      - narwhals-rolling-window-suite
+      - oxvg-structural-selector-preservation
+      - participle-grammar-conflict-analysis
+      - prometheus-transactional-reload-status
+      - scriggo-method-declarations
+      - skrub-duration-encoding
+      - sql-formatter-bigquery-pipe-formatting
+      - superjson-error-stack-serialization
+      - tomlkit-toml-table-converters
+      - vitest-duration-sharding
+      - wasmi-trap-coredumps

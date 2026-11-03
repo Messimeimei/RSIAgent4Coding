@@ -1,0 +1,10 @@
+{
+  "deep_swe_commit": "0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea",
+  "pier_commit": "b26211ed2bbee6d145f6b8c5b80e39f18b296f08",
+  "pier_version": "0.3.1",
+  "bitfun_version": "0.2.15",
+  "bitfun_release_url": "https://github.com/GCWing/OpenBitFun/releases/download/v0.2.15/bitfun-cli-0.2.15-x86_64-unknown-linux-gnu.tar.gz",
+  "bitfun_archive_sha256": "38996919bf68f9b4d71f67c76a8b5dae9a300df1055a3a98a6429b93b957a6d5",
+  "bitfun_binary_sha256": "0bc6c7766773c915b9c5dfe026c5e971700304ebba688f6e528c8ab794e989e0",
+  "adapter_source_commit": "7ad62874136f489c88ce25dfea40cbca3d8403f3"
+}

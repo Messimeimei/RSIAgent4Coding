@@ -1,0 +1,2322 @@
+"""BitFun adapter ported from openBitFun/bitfun_harbor_fork.
+
+See PROVENANCE.md for the pinned source and port changes.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+from pier.agents.installed.base import (
+    BaseInstalledAgent,
+    NonZeroAgentExitCodeError,
+    with_prompt_template,
+)
+from pier.environments.base import BaseEnvironment
+from pier.models.agent.context import AgentContext
+from pier.models.trajectories import (
+    Agent,
+    FinalMetrics,
+    Metrics,
+    Observation,
+    ObservationResult,
+    Step,
+    SubagentTrajectoryRef,
+    ToolCall,
+    Trajectory,
+)
+from pier.models.trial.paths import EnvironmentPaths
+from pier.utils.trajectory_utils import format_trajectory_json
+
+_DEFAULT_BINARY = "/usr/local/bin/bitfun-cli"
+_AGENT_LOG = "/logs/agent/bitfun.txt"
+_FAILURE_LOG_MAX_BYTES = 512 * 1024
+_FAILURE_LOG_HEAD_BYTES = 8 * 1024
+_FAILURE_LOG_TAIL_BYTES = 32 * 1024
+_FAILURE_LOG_TRUNC_MARKER = "\n...[truncated for host log]...\n"
+_ATIF_SCHEMA_VERSION = "ATIF-v1.7"
+_BITFUN_DATA_SUBDIR = "bitfun"  # under self.logs_dir
+PATCH_ARTIFACTS_SUBDIR = "patch"
+_REMOTE_BITFUN_CONFIG_DIR = "/logs/agent/bitfun/config"
+_REMOTE_APP_CONFIG_REDACTED_PATH = f"{_REMOTE_BITFUN_CONFIG_DIR}/app.redacted.json"
+_APP_CONFIG_REDACTED_ARTIFACT_PATH = "agent/bitfun/config/app.redacted.json"
+_REMOTE_CP_BACK_MANIFEST_PATH = "/logs/agent/bitfun/cp-back-manifest.json"
+_REDACTED_CONFIG_VALUE = "[REDACTED]"
+_SENSITIVE_CONFIG_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "auth_token",
+        "bearer_token",
+        "authorization",
+        "password",
+        "passphrase",
+        "secret",
+        "client_secret",
+        "private_key",
+        "credential",
+        "credentials",
+    }
+)
+_SENSITIVE_CONFIG_SUFFIXES = ("_secret", "_password", "_private_key")
+
+
+def build_repo_baseline_capture_script(log_dir: str) -> str:
+    return f"""set -eu
+LOG_DIR={shlex.quote(log_dir)}
+mkdir -p "$LOG_DIR"
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "not-a-git-repository" > "$LOG_DIR/repo-capture.error.txt"
+  exit 0
+fi
+export GIT_AUTHOR_NAME="Harbor BitFun"
+export GIT_AUTHOR_EMAIL="bitfun-cli@harbor.invalid"
+export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+echo "$REPO_ROOT" > "$LOG_DIR/repo-root.txt"
+git rev-parse HEAD > "$LOG_DIR/git-head.before.txt" 2>/dev/null || true
+git status --porcelain=v1 > "$LOG_DIR/git-status.before.txt" 2>/dev/null || true
+git log --oneline --decorate -n 20 > "$LOG_DIR/git-log.before.txt" 2>/dev/null || true
+TMP_INDEX="$(mktemp)"
+trap 'rm -f "$TMP_INDEX"' EXIT
+rm -f "$TMP_INDEX"
+GIT_INDEX_FILE="$TMP_INDEX" git read-tree -m HEAD
+GIT_INDEX_FILE="$TMP_INDEX" git add -A
+BASE_TREE="$(GIT_INDEX_FILE="$TMP_INDEX" git write-tree)"
+BASE_COMMIT="$(printf 'harbor-bitfun-baseline\\n' | git commit-tree "$BASE_TREE")"
+echo "$BASE_COMMIT" > "$LOG_DIR/git-baseline-commit.txt"
+"""
+
+
+def build_repo_final_capture_script(log_dir: str) -> str:
+    return f"""set -eu
+LOG_DIR={shlex.quote(log_dir)}
+if [ ! -f "$LOG_DIR/repo-root.txt" ] || [ ! -f "$LOG_DIR/git-baseline-commit.txt" ]; then
+  echo "missing-baseline" > "$LOG_DIR/fix-patch.error.txt"
+  exit 0
+fi
+export GIT_AUTHOR_NAME="Harbor BitFun"
+export GIT_AUTHOR_EMAIL="bitfun-cli@harbor.invalid"
+export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+REPO_ROOT="$(cat "$LOG_DIR/repo-root.txt")"
+BASE_COMMIT="$(cat "$LOG_DIR/git-baseline-commit.txt")"
+cd "$REPO_ROOT"
+git rev-parse HEAD > "$LOG_DIR/git-head.after.txt" 2>/dev/null || true
+git status --porcelain=v1 > "$LOG_DIR/git-status.after.txt" 2>/dev/null || true
+git log --oneline --decorate -n 20 > "$LOG_DIR/git-log.after.txt" 2>/dev/null || true
+TMP_INDEX="$(mktemp)"
+trap 'rm -f "$TMP_INDEX"' EXIT
+rm -f "$TMP_INDEX"
+GIT_INDEX_FILE="$TMP_INDEX" git read-tree -m HEAD
+GIT_INDEX_FILE="$TMP_INDEX" git add -A
+FINAL_TREE="$(GIT_INDEX_FILE="$TMP_INDEX" git write-tree)"
+FINAL_COMMIT="$(printf 'harbor-bitfun-final\\n' | git commit-tree "$FINAL_TREE")"
+echo "$FINAL_COMMIT" > "$LOG_DIR/git-final-commit.txt"
+git diff --binary "$BASE_COMMIT" "$FINAL_COMMIT" > "$LOG_DIR/fix.patch" 2>/dev/null || true
+git diff --stat "$BASE_COMMIT" "$FINAL_COMMIT" > "$LOG_DIR/fix.stat.txt" 2>/dev/null || true
+git diff --name-status "$BASE_COMMIT" "$FINAL_COMMIT" > "$LOG_DIR/fix.name-status.txt" 2>/dev/null || true
+find "$LOG_DIR" -maxdepth 4 -type f | sort > "$LOG_DIR/artifacts.index.txt" 2>/dev/null || true
+"""
+
+
+def _format_failure_log_text(text: str) -> str:
+    if len(text) <= _FAILURE_LOG_MAX_BYTES:
+        return text
+    return (
+        text[:_FAILURE_LOG_HEAD_BYTES]
+        + _FAILURE_LOG_TRUNC_MARKER
+        + text[-_FAILURE_LOG_TAIL_BYTES:]
+    )
+
+
+_STDOUT_TOKEN_STATS_RE = re.compile(
+    r"Dialog turn completed - Token stats:.*?"
+    r"prompt_tokens=(?P<prompt>\d+),\s*"
+    r"completion_tokens=(?P<completion>\d+),\s*"
+    r"total_tokens=(?P<total>\d+)"
+    r"(?:,\s*cached_tokens=(?P<cached>\d+))?"
+    r"(?:,\s*cached_tokens_available=(?P<cache_coverage>true|false|partial))?"
+)
+
+_CP_BACK_COMMAND = """\
+set +e
+PROJECT_PATH=""
+if [ -d "$HOME/.bitfun/projects" ]; then
+  for d in "$HOME/.bitfun/projects/testbed" \\
+           "$HOME/.bitfun/projects/-testbed"; do
+    [ -d "$d/sessions" ] && PROJECT_PATH="$d" && break
+  done
+fi
+if [ -z "$PROJECT_PATH" ]; then
+  LATEST_SESSIONS=$(ls -dt "$HOME"/.bitfun/projects/*/sessions/ 2>/dev/null | head -1)
+  [ -n "$LATEST_SESSIONS" ] && PROJECT_PATH=$(dirname "${LATEST_SESSIONS%/}")
+fi
+SESSIONS_SRC=""
+REQUEST_TRACES_SRC=""
+if [ -n "$PROJECT_PATH" ]; then
+  SESSIONS_SRC="$PROJECT_PATH/sessions"
+  REQUEST_TRACES_SRC="$PROJECT_PATH/request-traces"
+fi
+mkdir -p /logs/agent/bitfun/sessions
+if [ -n "$SESSIONS_SRC" ]; then
+  cp -R "$SESSIONS_SRC"/. /logs/agent/bitfun/sessions/ 2>/dev/null || true
+fi
+if [ -d "$REQUEST_TRACES_SRC" ]; then
+  mkdir -p /logs/agent/bitfun/request-traces
+  cp -R "$REQUEST_TRACES_SRC"/. /logs/agent/bitfun/request-traces/ 2>/dev/null || true
+fi
+BITFUN_CONFIG_DIR="$HOME/.config/bitfun"
+TOKEN_USAGE_SRC="$BITFUN_CONFIG_DIR/data/token_usage"
+CLI_LOGS_SRC="$BITFUN_CONFIG_DIR/cli-logs"
+CLI_LOG_SRC="$BITFUN_CONFIG_DIR/logs/bitfun-cli.log"
+AI_AUDIT_SRC="$BITFUN_CONFIG_DIR/logs/ai-request-audit.jsonl"
+MANIFEST=/logs/agent/bitfun/cp-back-manifest.json
+json_string() {
+  printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+if [ -d "$TOKEN_USAGE_SRC" ]; then
+  cp -R "$TOKEN_USAGE_SRC" /logs/agent/bitfun/ 2>/dev/null || true
+fi
+if [ -d "$CLI_LOGS_SRC" ]; then
+  cp -R "$CLI_LOGS_SRC" /logs/agent/bitfun/ 2>/dev/null || true
+fi
+if [ -f "$CLI_LOG_SRC" ]; then
+  cp "$CLI_LOG_SRC" /logs/agent/bitfun/cli.log 2>/dev/null || true
+fi
+if [ -f "$AI_AUDIT_SRC" ]; then
+  cp "$AI_AUDIT_SRC" /logs/agent/bitfun/ai-request-audit.jsonl 2>/dev/null || true
+fi
+printf '{"bitfun_config_dir":%s,"sessions":{"source":%s,"exists":%s},"request_traces":{"source":%s,"exists":%s},"token_usage":{"source":%s,"exists":%s},"cli_logs":{"source":%s,"exists":%s},"cli_log":{"source":%s,"exists":%s,"size_bytes":%s},"ai_request_audit":{"source":%s,"exists":%s,"size_bytes":%s}}\n' \
+  "$(json_string "$BITFUN_CONFIG_DIR")" \
+  "$(json_string "${SESSIONS_SRC:-}")" \
+  "$([ -n "$SESSIONS_SRC" ] && [ -d "$SESSIONS_SRC" ] && printf true || printf false)" \
+  "$(json_string "${REQUEST_TRACES_SRC:-}")" \
+  "$([ -n "$REQUEST_TRACES_SRC" ] && [ -d "$REQUEST_TRACES_SRC" ] && printf true || printf false)" \
+  "$(json_string "$TOKEN_USAGE_SRC")" \
+  "$([ -d "$TOKEN_USAGE_SRC" ] && printf true || printf false)" \
+  "$(json_string "$CLI_LOGS_SRC")" \
+  "$([ -d "$CLI_LOGS_SRC" ] && printf true || printf false)" \
+  "$(json_string "$CLI_LOG_SRC")" \
+  "$([ -f "$CLI_LOG_SRC" ] && printf true || printf false)" \
+  "$([ -f "$CLI_LOG_SRC" ] && wc -c < "$CLI_LOG_SRC" 2>/dev/null || printf 0)" \
+  "$(json_string "$AI_AUDIT_SRC")" \
+  "$([ -f "$AI_AUDIT_SRC" ] && printf true || printf false)" \
+  "$([ -f "$AI_AUDIT_SRC" ] && wc -c < "$AI_AUDIT_SRC" 2>/dev/null || printf 0)" \
+  > "$MANIFEST" 2>/dev/null || true
+"""
+
+
+def _bitfun_config_root_shell() -> str:
+    return (
+        'BITFUN_CONFIG_ROOT="${BITFUN_USER_ROOT:-}"\n'
+        'if [ -z "$BITFUN_CONFIG_ROOT" ]; then\n'
+        '  BITFUN_CONFIG_ROOT="${BITFUN_E2E_USER_ROOT:-}"\n'
+        "fi\n"
+        'if [ -z "$BITFUN_CONFIG_ROOT" ]; then\n'
+        '  BITFUN_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"\n'
+        '  BITFUN_CONFIG_ROOT="$BITFUN_XDG_CONFIG_HOME/bitfun"\n'
+        "fi\n"
+    )
+
+
+# Copied into the container exec env when set on the Harbor host / orchestrator.
+_ENV_PASSTHROUGH: tuple[str, ...] = (
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+)
+
+
+class BitfunCli(BaseInstalledAgent):
+    """Run BitFun CLI in non-interactive `exec` mode (binary supplied via bind mount)."""
+
+    SUPPORTS_ATIF: bool = True
+
+    def __init__(
+        self,
+        logs_dir: Path,
+        binary_path: str = _DEFAULT_BINARY,
+        exec_agent: str = "agentic",
+        output_patch_path: str | None = "/logs/agent/bitfun.patch",
+        bitfun_config: dict[str, Any] | None = None,
+        *args,
+        **kwargs,
+    ) -> None:
+        if bitfun_config is not None and not isinstance(bitfun_config, dict):
+            raise ValueError("bitfun_config must be a dict")
+        self._binary_path = binary_path
+        self._exec_agent = exec_agent
+        self._output_patch_path = output_patch_path
+        self._bitfun_config = bitfun_config
+        super().__init__(logs_dir, *args, **kwargs)
+
+    @property
+    def _patch_logs_dir(self) -> Path:
+        return self.logs_dir / PATCH_ARTIFACTS_SUBDIR
+
+    @property
+    def _patch_logs_dir_in_env(self) -> PurePosixPath:
+        return EnvironmentPaths.agent_dir / PATCH_ARTIFACTS_SUBDIR
+
+    @staticmethod
+    def name() -> str:
+        return "bitfun-cli"
+
+    def get_version_command(self) -> str | None:
+        return f"{shlex.quote(self._binary_path)} --version"
+
+    async def install(self, environment: BaseEnvironment) -> None:
+        quoted = shlex.quote(self._binary_path)
+        await self.exec_as_agent(
+            environment,
+            command=(
+                "set -euo pipefail; "
+                f"test -e {quoted}; "
+                f"chmod a+x {quoted} 2>/dev/null || true; "
+                f"{quoted} --version"
+            ),
+        )
+
+    def _get_session_dir(self) -> Path | None:
+        """Locate the main BitFun *standard* session directory under self.logs_dir.
+
+        Layout (populated by the cp-back finally block in `run()`)::
+
+            <logs_dir>/bitfun/sessions/<sid>/metadata.json
+            <logs_dir>/bitfun/sessions/<sid>/turns/turn-*.json
+
+        Filters out subagent sessions (`sessionKind == "subagent"`). Returns the
+        unique standard session when exactly one is present; otherwise picks the
+        most recently modified standard session (mtime fallback). Returns
+        ``None`` when no readable standard session exists.
+        """
+        sessions_root = self.logs_dir / _BITFUN_DATA_SUBDIR / "sessions"
+        if not sessions_root.is_dir():
+            return None
+
+        candidates: list[Path] = []
+        for entry in sessions_root.iterdir():
+            if not entry.is_dir():
+                continue
+            meta_path = entry / "metadata.json"
+            if not meta_path.is_file():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if meta.get("sessionKind", "standard") == "subagent":
+                continue
+            candidates.append(entry)
+
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        self.logger.debug(
+            "Multiple BitFun standard sessions found; falling back to mtime",
+        )
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    def _load_token_records(self) -> list[dict[str, Any]]:
+        """Aggregate all BitFun TokenUsageRecord entries from records/*.json files.
+
+        Malformed JSON or unreadable files are skipped silently with a debug log.
+        Returns an empty list when the records directory does not exist.
+        """
+        records_dir = self.logs_dir / _BITFUN_DATA_SUBDIR / "token_usage" / "records"
+        if not records_dir.is_dir():
+            return []
+
+        out: list[dict[str, Any]] = []
+        for jf in sorted(records_dir.glob("*.json")):
+            try:
+                batch = json.loads(jf.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                self.logger.debug(f"Skipping malformed token-record file {jf}: {exc}")
+                continue
+            if not isinstance(batch, dict):
+                continue
+            recs = batch.get("records")
+            if isinstance(recs, list):
+                out.extend(r for r in recs if isinstance(r, dict))
+        return out
+
+    def _load_stdout_token_stats(self) -> dict[str, Any] | None:
+        """Parse aggregate token totals from BitFun stdout when records are absent.
+
+        Older/non-server `bitfun-cli exec` runs may not persist
+        `token_usage/records`, but they still log per-turn aggregate totals like:
+
+            Dialog turn completed - Token stats: ..., prompt_tokens=10,
+            completion_tokens=2, total_tokens=12
+
+        This is less detailed than TokenUsageRecord files, so it is only used as
+        a fallback for final metrics.
+        """
+        log_path = self.logs_dir / "bitfun.txt"
+        if not log_path.is_file():
+            return None
+        try:
+            text = log_path.read_text(errors="replace")
+        except OSError as exc:
+            self.logger.debug(f"Failed to read BitFun stdout log {log_path}: {exc}")
+            return None
+
+        prompt = 0
+        completion = 0
+        total = 0
+        cached = 0
+        count = 0
+        cached_count = 0
+        saw_partial_cache = False
+        saw_unavailable_cache = False
+        for match in _STDOUT_TOKEN_STATS_RE.finditer(text):
+            prompt += int(match.group("prompt"))
+            completion += int(match.group("completion"))
+            total += int(match.group("total"))
+            count += 1
+            cached_value = match.group("cached")
+            if cached_value is not None:
+                cached += int(cached_value)
+                cached_count += 1
+            cache_coverage = match.group("cache_coverage")
+            if cache_coverage == "partial":
+                saw_partial_cache = True
+            elif cache_coverage == "false":
+                saw_unavailable_cache = True
+
+        if count == 0:
+            return None
+        cache_coverage = "false"
+        cached_tokens: int | None = None
+        if saw_partial_cache:
+            cache_coverage = "partial"
+            cached_tokens = cached if cached_count > 0 else None
+        elif cached_count == count:
+            cache_coverage = "true"
+            cached_tokens = cached
+        elif cached_count > 0:
+            cache_coverage = "partial"
+            cached_tokens = cached
+        elif saw_unavailable_cache:
+            cache_coverage = "false"
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "cached_tokens": cached_tokens,
+            "total_tokens": total,
+            "record_count": count,
+            "cached_tokens_available": cache_coverage == "true",
+            "cached_tokens_coverage": cache_coverage,
+        }
+
+    def _compute_cost_via_litellm(
+        self,
+        model_id: str | None,
+        prompt_tokens: int | None,
+        cached_tokens: int | None,
+        completion_tokens: int | None,
+    ) -> float | None:
+        """Compute USD cost for a token record via litellm.model_cost.
+
+        BitFun records token counts only; cost must be derived. Returns None
+        when the model is not in litellm.model_cost so callers can leave
+        `cost_usd` unset rather than report a misleading $0.
+
+        Mirrors Codex._compute_cost_from_pricing: cached input tokens are
+        billed at `cache_read_input_token_cost` when present, otherwise at
+        `input_cost_per_token`.
+        """
+        lookup = model_id or self.model_name
+        if not lookup:
+            return None
+
+        try:
+            import litellm
+        except ImportError:
+            self.logger.debug("litellm not available; bitfun cost_usd will be None")
+            return None
+
+        pricing: dict[str, Any] | None = None
+        for key in (lookup, lookup.split("/", 1)[-1]):
+            entry = litellm.model_cost.get(key)
+            if entry:
+                pricing = entry
+                break
+
+        if pricing is None:
+            self.logger.debug(
+                "No LiteLLM pricing for model %r; bitfun cost_usd will be None",
+                lookup,
+            )
+            return None
+
+        input_rate = pricing.get("input_cost_per_token") or 0.0
+        output_rate = pricing.get("output_cost_per_token") or 0.0
+        cache_read_rate = pricing.get("cache_read_input_token_cost", input_rate)
+        if cache_read_rate is None:
+            cache_read_rate = input_rate
+
+        uncached_input = max(0, (prompt_tokens or 0) - (cached_tokens or 0))
+        cached = cached_tokens or 0
+        output = completion_tokens or 0
+
+        return (
+            uncached_input * input_rate
+            + cached * cache_read_rate
+            + output * output_rate
+        )
+
+    @staticmethod
+    def _ts_iso(ms: int | None) -> str | None:
+        """Convert BitFun's u64 epoch-ms timestamp to ISO-8601 UTC."""
+        if ms is None:
+            return None
+        return (
+            datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    @staticmethod
+    def _strip_user_query_wrapper(content: str) -> str:
+        """BitFun wraps exec input in <user_query>…</user_query>; strip if present."""
+        text = content.strip()
+        if text.startswith("<user_query>") and text.endswith("</user_query>"):
+            inner = text[len("<user_query>") : -len("</user_query>")]
+            return inner.strip()
+        return text
+
+    @classmethod
+    def _user_text_from_message(cls, user_message: dict[str, Any]) -> str:
+        meta = user_message.get("metadata") or {}
+        original = meta.get("original_text")
+        if isinstance(original, str) and original:
+            return original
+        return cls._strip_user_query_wrapper(user_message.get("content") or "")
+
+    def _load_turns(self, session_dir: Path) -> list[dict[str, Any]]:
+        """Read all turn-*.json files sorted by turnIndex ascending; skip malformed."""
+        turns_dir = session_dir / "turns"
+        if not turns_dir.is_dir():
+            return []
+        turns: list[dict[str, Any]] = []
+        for jf in sorted(turns_dir.glob("turn-*.json")):
+            try:
+                turns.append(json.loads(jf.read_text()))
+            except (OSError, json.JSONDecodeError) as exc:
+                self.logger.debug(f"Skipping malformed turn file {jf}: {exc}")
+        turns.sort(key=lambda t: t.get("turnIndex", 0))
+        return turns
+
+    @staticmethod
+    def _snapshot_ts_ms(ts: Any) -> int | None:
+        """Convert BitFun's snapshot `{secs_since_epoch, nanos_since_epoch}` to epoch ms."""
+        if not isinstance(ts, dict):
+            return None
+        secs = ts.get("secs_since_epoch")
+        nanos = ts.get("nanos_since_epoch") or 0
+        if not isinstance(secs, (int, float)):
+            return None
+        return int(secs * 1000 + int(nanos) // 1_000_000)
+
+    def _synthesize_turns_from_snapshot(
+        self, session_dir: Path
+    ) -> list[dict[str, Any]] | None:
+        """Reconstruct turn-shaped dicts from `snapshots/context-*.json`.
+
+        BitFun's ``exec`` mode (observed in 0.2.7) sometimes only persists a
+        single synthetic ``-final-round`` to ``turns/turn-*.json`` with no
+        ``toolItems``/``thinkingItems``, while the *complete* message history
+        is preserved in ``snapshots/context-NNNN.json``. We rebuild a
+        turn-file-shaped structure from the snapshot so the existing
+        ``_round_to_steps()`` pipeline can produce a complete trajectory.
+
+        Returns None when no readable snapshot or no turn-keyed messages exist.
+        """
+        snapshots_dir = session_dir / "snapshots"
+        if not snapshots_dir.is_dir():
+            return None
+        candidates = sorted(snapshots_dir.glob("context-*.json"))
+        if not candidates:
+            return None
+
+        latest = candidates[-1]
+        try:
+            snapshot = json.loads(latest.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            self.logger.debug(f"Skipping malformed snapshot {latest}: {exc}")
+            return None
+
+        messages = snapshot.get("messages")
+        if not isinstance(messages, list):
+            return None
+
+        turn_order: list[str] = []
+        by_turn: dict[str, list[dict[str, Any]]] = {}
+        for msg in messages:
+            meta = msg.get("metadata") or {}
+            turn_id = meta.get("turn_id")
+            if not isinstance(turn_id, str):
+                continue
+            if turn_id not in by_turn:
+                turn_order.append(turn_id)
+                by_turn[turn_id] = []
+            by_turn[turn_id].append(msg)
+
+        if not by_turn:
+            return None
+
+        # tool_id -> Tool result message (across all turns; tool_ids are unique)
+        tool_results_by_id: dict[str, dict[str, Any]] = {}
+        for msg in messages:
+            if msg.get("role") != "Tool":
+                continue
+            tr = (msg.get("content") or {}).get("ToolResult") or {}
+            tid = tr.get("tool_id")
+            if isinstance(tid, str):
+                tool_results_by_id[tid] = msg
+
+        synthesized: list[dict[str, Any]] = []
+        session_id = snapshot.get("session_id")
+        for turn_idx, turn_id in enumerate(turn_order):
+            msgs = by_turn[turn_id]
+            user_msg = next((m for m in msgs if m.get("role") == "User"), None)
+            if user_msg is None:
+                continue
+
+            user_text = ""
+            user_content_obj = user_msg.get("content")
+            if isinstance(user_content_obj, dict):
+                t = user_content_obj.get("Text")
+                if isinstance(t, str):
+                    user_text = t
+            user_ts_ms = self._snapshot_ts_ms(user_msg.get("timestamp"))
+
+            round_order: list[str] = []
+            by_round: dict[str, list[dict[str, Any]]] = {}
+            for m in msgs:
+                if m.get("role") == "User":
+                    continue
+                meta = m.get("metadata") or {}
+                rid = meta.get("round_id")
+                if not isinstance(rid, str):
+                    continue
+                if rid not in by_round:
+                    round_order.append(rid)
+                    by_round[rid] = []
+                by_round[rid].append(m)
+
+            model_rounds: list[dict[str, Any]] = []
+            for round_idx, rid in enumerate(round_order):
+                text_items: list[dict[str, Any]] = []
+                tool_items: list[dict[str, Any]] = []
+                thinking_items: list[dict[str, Any]] = []
+                round_ts_ms: int | None = None
+                order_idx = 0
+
+                for m in by_round[rid]:
+                    if m.get("role") != "Assistant":
+                        continue
+                    m_ts = self._snapshot_ts_ms(m.get("timestamp"))
+                    if round_ts_ms is None and m_ts is not None:
+                        round_ts_ms = m_ts
+
+                    content = m.get("content") or {}
+                    mixed = content.get("Mixed") if isinstance(content, dict) else None
+                    if not isinstance(mixed, dict):
+                        continue
+
+                    reasoning = mixed.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        thinking_items.append(
+                            {
+                                "id": f"{m.get('id')}-th",
+                                "content": reasoning,
+                                "timestamp": m_ts,
+                                "orderIndex": order_idx,
+                            }
+                        )
+                        order_idx += 1
+
+                    text = mixed.get("text")
+                    if isinstance(text, str) and text:
+                        text_items.append(
+                            {
+                                "id": f"{m.get('id')}-text",
+                                "content": text,
+                                "timestamp": m_ts,
+                                "orderIndex": order_idx,
+                                "status": "completed",
+                                "isMarkdown": True,
+                            }
+                        )
+                        order_idx += 1
+
+                    for tc in mixed.get("tool_calls") or []:
+                        tool_id = tc.get("tool_id") or ""
+                        tool_name = tc.get("tool_name") or ""
+                        args = tc.get("arguments")
+                        if not isinstance(args, dict):
+                            args = {"input": args} if args is not None else {}
+                        tool_item: dict[str, Any] = {
+                            "id": tool_id or f"{m.get('id')}-tc{order_idx}",
+                            "toolName": tool_name,
+                            "toolCall": {"id": tool_id, "input": args},
+                            "timestamp": m_ts,
+                            "orderIndex": order_idx,
+                            "status": "completed",
+                        }
+                        tr_msg = tool_results_by_id.get(tool_id) if tool_id else None
+                        if tr_msg is not None:
+                            tr = (tr_msg.get("content") or {}).get("ToolResult") or {}
+                            is_error = bool(tr.get("is_error"))
+                            tool_result: dict[str, Any] = {
+                                "result": tr.get("result"),
+                                "resultForAssistant": tr.get("result_for_assistant"),
+                                "success": not is_error,
+                            }
+                            if is_error:
+                                tool_result["error"] = (
+                                    tr.get("result_for_assistant") or "tool error"
+                                )
+                            tool_item["toolResult"] = tool_result
+                        tool_items.append(tool_item)
+                        order_idx += 1
+
+                model_rounds.append(
+                    {
+                        "id": rid,
+                        "turnId": turn_id,
+                        "roundIndex": round_idx,
+                        "timestamp": round_ts_ms,
+                        "textItems": text_items,
+                        "toolItems": tool_items,
+                        "thinkingItems": thinking_items,
+                        "status": "completed",
+                    }
+                )
+
+            original = self._strip_user_query_wrapper(user_text) if user_text else ""
+            synthesized.append(
+                {
+                    "schema_version": 2,
+                    "turnId": turn_id,
+                    "turnIndex": turn_idx,
+                    "sessionId": session_id,
+                    "timestamp": user_ts_ms,
+                    "kind": "user_dialog",
+                    "userMessage": {
+                        "id": user_msg.get("id"),
+                        "content": user_text,
+                        "timestamp": user_ts_ms,
+                        "metadata": {"original_text": original},
+                    },
+                    "modelRounds": model_rounds,
+                    "status": "completed",
+                }
+            )
+
+        return synthesized or None
+
+    @staticmethod
+    def _count_rounds(turns: list[dict[str, Any]]) -> int:
+        """Total number of modelRounds across all turns (used to pick richer source)."""
+        return sum(len(t.get("modelRounds") or []) for t in turns)
+
+    def _load_turns_preferring_snapshot(
+        self, session_dir: Path
+    ) -> list[dict[str, Any]]:
+        """Load turns, preferring the snapshot-derived source when it is richer.
+
+        BitFun's ``exec`` mode can leave ``turns/`` with only a synthetic
+        ``-final-round`` placeholder while the full conversation lives in
+        ``snapshots/context-*.json``. When the snapshot has strictly more
+        rounds than the turn files we use the snapshot-derived turns;
+        otherwise we keep the turn-file data (which carries richer metadata
+        like ``durationMs`` and subagent fields).
+        """
+        turns_from_files = self._load_turns(session_dir)
+        synthesized = self._synthesize_turns_from_snapshot(session_dir)
+        if synthesized is None:
+            return turns_from_files
+
+        file_rounds = self._count_rounds(turns_from_files)
+        snap_rounds = self._count_rounds(synthesized)
+        if snap_rounds > file_rounds:
+            self.logger.debug(
+                "Using BitFun snapshot-derived turns (%d rounds) over turn files (%d rounds) in %s",
+                snap_rounds,
+                file_rounds,
+                session_dir,
+            )
+            return synthesized
+        return turns_from_files
+
+    def _round_to_steps(
+        self,
+        rnd: dict[str, Any],
+        turn: dict[str, Any],
+        next_step_id: int,
+        *,
+        default_model_name: str | None,
+    ) -> tuple[list[Step], int]:
+        """Convert one modelRound into ATIF steps (text + thinking + tools)."""
+        items: list[dict[str, Any]] = []
+        for ti in rnd.get("textItems") or []:
+            items.append({"_kind": "text", **ti})
+        for th in rnd.get("thinkingItems") or []:
+            items.append({"_kind": "thinking", **th})
+        for to in rnd.get("toolItems") or []:
+            items.append({"_kind": "tool", **to})
+        items.sort(key=lambda x: (x.get("orderIndex") or 0, x.get("timestamp") or 0))
+
+        new_steps: list[Step] = []
+        model_id = rnd.get("modelId") or default_model_name
+        pending_reasoning: list[str] = []
+
+        def _flush_reasoning() -> str | None:
+            if not pending_reasoning:
+                return None
+            joined = "\n\n".join(part for part in pending_reasoning if part)
+            pending_reasoning.clear()
+            return joined or None
+
+        for item in items:
+            kind = item["_kind"]
+            if kind == "thinking":
+                content = item.get("content") or ""
+                if content:
+                    pending_reasoning.append(content)
+                continue
+            if kind == "text":
+                new_steps.append(
+                    Step(
+                        step_id=next_step_id,
+                        timestamp=self._ts_iso(
+                            item.get("timestamp") or rnd.get("timestamp")
+                        ),
+                        source="agent",
+                        message=item.get("content") or "",
+                        model_name=model_id,
+                        reasoning_content=_flush_reasoning(),
+                        extra={
+                            "turn_id": turn.get("turnId"),
+                            "round_id": rnd.get("id"),
+                            "round_index": rnd.get("roundIndex"),
+                            "model_alias": rnd.get("modelAlias"),
+                            "provider_id": rnd.get("providerId"),
+                            "status": item.get("status"),
+                            "round_status": rnd.get("status"),
+                            "attempt_count": rnd.get("attemptCount"),
+                            "failure_category": rnd.get("failureCategory"),
+                        },
+                    )
+                )
+                next_step_id += 1
+                continue
+            if kind == "tool":
+                tc_block = item.get("toolCall") or {}
+                tool_call_id = tc_block.get("id") or item.get("id") or ""
+                raw_input = tc_block.get("input")
+                if isinstance(raw_input, dict):
+                    arguments = raw_input
+                else:
+                    arguments = {"input": raw_input}
+
+                tool_name = item.get("toolName") or ""
+
+                tool_extra = {
+                    "tool_item_id": item.get("id"),
+                    "queue_wait_ms": item.get("queueWaitMs"),
+                    "preflight_ms": item.get("preflightMs"),
+                    "confirmation_wait_ms": item.get("confirmationWaitMs"),
+                    "execution_ms": item.get("executionMs"),
+                    "interruption_reason": item.get("interruptionReason"),
+                }
+                tool_extra = {
+                    k: v for k, v in tool_extra.items() if v is not None
+                } or None
+
+                tool_call = ToolCall(
+                    tool_call_id=tool_call_id,
+                    function_name=tool_name,
+                    arguments=arguments,
+                    extra=tool_extra,
+                )
+
+                tool_result = item.get("toolResult") or {}
+                rfa = tool_result.get("resultForAssistant")
+                raw_result = tool_result.get("result")
+                if isinstance(rfa, str) and rfa:
+                    content: str | None = rfa
+                elif raw_result is not None:
+                    try:
+                        content = json.dumps(raw_result, ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        content = str(raw_result)
+                else:
+                    content = None
+
+                obs_extra = {
+                    "raw_result": raw_result,
+                    "success": tool_result.get("success"),
+                    "error": tool_result.get("error"),
+                    "tool_duration_ms": tool_result.get("durationMs"),
+                }
+                obs_extra = {
+                    k: v for k, v in obs_extra.items() if v is not None
+                } or None
+
+                subagent_sid = item.get("subagentSessionId")
+                sub_model_id = item.get("subagentModelId")
+                sub_ref = (
+                    [
+                        SubagentTrajectoryRef(
+                            trajectory_id=subagent_sid,
+                            session_id=subagent_sid,
+                            extra={
+                                "tool_call_id": tool_call_id,
+                                "tool_name": tool_name,
+                                "subagent_model_id": sub_model_id,
+                            },
+                        )
+                    ]
+                    if subagent_sid
+                    else None
+                )
+
+                obs_result = ObservationResult(
+                    source_call_id=tool_call_id,
+                    content=content,
+                    subagent_trajectory_ref=sub_ref,
+                    extra=obs_extra,
+                )
+
+                new_steps.append(
+                    Step(
+                        step_id=next_step_id,
+                        timestamp=self._ts_iso(
+                            item.get("startTime")
+                            or item.get("timestamp")
+                            or rnd.get("timestamp")
+                        ),
+                        source="agent",
+                        message=item.get("aiIntent") or f"Executed {tool_name}",
+                        model_name=model_id,
+                        reasoning_content=_flush_reasoning(),
+                        tool_calls=[tool_call],
+                        observation=Observation(results=[obs_result]),
+                        extra={
+                            "turn_id": turn.get("turnId"),
+                            "round_id": rnd.get("id"),
+                            "tool_status": item.get("status"),
+                            "is_subagent_dispatch": bool(subagent_sid),
+                        },
+                    )
+                )
+                next_step_id += 1
+                continue
+
+        if not new_steps:
+            new_steps.append(
+                Step(
+                    step_id=next_step_id,
+                    timestamp=self._ts_iso(rnd.get("timestamp")),
+                    source="agent",
+                    message="",
+                    model_name=model_id,
+                    extra={
+                        "turn_id": turn.get("turnId"),
+                        "round_id": rnd.get("id"),
+                        "round_index": rnd.get("roundIndex"),
+                        "round_status": rnd.get("status"),
+                        "attempt_count": rnd.get("attemptCount"),
+                        "failure_category": rnd.get("failureCategory"),
+                        "duration_ms": rnd.get("durationMs"),
+                        "is_placeholder_empty_round": True,
+                    },
+                )
+            )
+            next_step_id += 1
+
+        return new_steps, next_step_id
+
+    @staticmethod
+    def _parse_record_ts_ms(record: dict[str, Any]) -> int | None:
+        """Parse a token record's ISO-8601 timestamp into epoch milliseconds."""
+        raw = record.get("timestamp")
+        if not isinstance(raw, str):
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return int(dt.timestamp() * 1000)
+
+    @staticmethod
+    def _parse_llm_latency_ms(record: dict[str, Any]) -> tuple[int | None, str | None]:
+        """Return usable non-negative latency and an unavailable reason, if any."""
+        raw = record.get("llm_latency_ms")
+        if raw is None:
+            return None, "missing_latency"
+        if isinstance(raw, bool):
+            return None, "missing_latency"
+        if isinstance(raw, int):
+            latency = raw
+        elif isinstance(raw, float) and raw.is_integer():
+            latency = int(raw)
+        else:
+            return None, "missing_latency"
+        if latency < 0:
+            return None, "missing_latency"
+        if latency == 0:
+            return 0, "zero_latency"
+        return latency, None
+
+    @staticmethod
+    def _build_tps_extra(
+        *,
+        completion_tokens: int,
+        llm_latency_ms: int | None,
+        unavailable_reason: str | None,
+        model_call_count: int = 1,
+    ) -> dict[str, Any]:
+        """Build step-level TPS fields for one (possibly merged) token record.
+
+        ``completion_tokens_per_second`` is completion tokens over the LLM
+        call's *end-to-end* latency (``llm_latency_ms``, which includes queueing
+        and time-to-first-token), so it reflects effective throughput rather
+        than raw decode speed. Step-level keys (``llm_latency_ms``,
+        ``tps_model_call_count``) are deliberately named differently from the
+        trajectory-summary keys produced by ``_build_final_tps_extra``
+        (``total_llm_latency_ms``, ``model_call_count``).
+        """
+        extra: dict[str, Any] = {}
+        if llm_latency_ms is not None:
+            extra["llm_latency_ms"] = llm_latency_ms
+        if llm_latency_ms and completion_tokens >= 0:
+            extra["completion_tokens_per_second"] = round(
+                completion_tokens * 1000.0 / llm_latency_ms, 2
+            )
+            extra["tps_completion_tokens"] = completion_tokens
+            extra["tps_model_call_count"] = model_call_count
+            extra["tps_latency_coverage"] = "complete"
+        elif unavailable_reason is not None:
+            extra["tps_unavailable_reason"] = unavailable_reason
+        return extra
+
+    @staticmethod
+    def _combine_tps_extras(
+        a_extra: dict[str, Any],
+        b_extra: dict[str, Any],
+        *,
+        total_completion_tokens: int,
+    ) -> dict[str, Any]:
+        covered_completion = int(a_extra.get("tps_completion_tokens") or 0) + int(
+            b_extra.get("tps_completion_tokens") or 0
+        )
+        covered_latency = int(a_extra.get("llm_latency_ms") or 0) + int(
+            b_extra.get("llm_latency_ms") or 0
+        )
+        covered_calls = int(a_extra.get("tps_model_call_count") or 0) + int(
+            b_extra.get("tps_model_call_count") or 0
+        )
+
+        combined: dict[str, Any] = {}
+        if covered_latency > 0:
+            combined["llm_latency_ms"] = covered_latency
+            combined["tps_completion_tokens"] = covered_completion
+            combined["tps_model_call_count"] = covered_calls
+            combined["completion_tokens_per_second"] = round(
+                covered_completion * 1000.0 / covered_latency, 2
+            )
+            combined["tps_latency_coverage"] = (
+                "complete"
+                if covered_completion == total_completion_tokens
+                else "partial"
+            )
+        elif a_extra.get("llm_latency_ms") == 0 or b_extra.get("llm_latency_ms") == 0:
+            combined["llm_latency_ms"] = 0
+            combined["tps_unavailable_reason"] = "zero_latency"
+        else:
+            combined["tps_unavailable_reason"] = "missing_latency"
+        return combined
+
+    def _build_metrics_from_record(self, record: dict[str, Any]) -> Metrics:
+        """Convert one BitFun TokenUsageRecord into an ATIF Metrics object."""
+        in_tok = int(record.get("input_tokens") or 0)
+        out_tok = int(record.get("output_tokens") or 0)
+        cached = int(record.get("cached_tokens") or 0)
+        model_id = record.get("model_id")
+        cost = self._compute_cost_via_litellm(model_id, in_tok, cached, out_tok)
+        llm_latency_ms, tps_unavailable_reason = self._parse_llm_latency_ms(record)
+        extra = {
+            "token_details": record.get("token_details"),
+            "total_tokens": record.get("total_tokens"),
+            "cached_tokens_available": record.get("cached_tokens_available"),
+            "record_timestamp": record.get("timestamp"),
+            "record_model_id": model_id,
+        }
+        extra.update(
+            self._build_tps_extra(
+                completion_tokens=out_tok,
+                llm_latency_ms=llm_latency_ms,
+                unavailable_reason=tps_unavailable_reason,
+            )
+        )
+        extra = {k: v for k, v in extra.items() if v is not None} or None
+        return Metrics(
+            prompt_tokens=in_tok,
+            completion_tokens=out_tok,
+            cached_tokens=cached,
+            cost_usd=cost,
+            extra=extra,
+        )
+
+    def _merge_metrics(self, a: Metrics, b: Metrics) -> Metrics:
+        """Combine two Metrics objects (for multiple token records on one step)."""
+        p = (a.prompt_tokens or 0) + (b.prompt_tokens or 0)
+        c = (a.completion_tokens or 0) + (b.completion_tokens or 0)
+        cache = (a.cached_tokens or 0) + (b.cached_tokens or 0)
+        if a.cost_usd is not None and b.cost_usd is not None:
+            cost = a.cost_usd + b.cost_usd
+        else:
+            cost = None
+        extra = {**(a.extra or {}), **(b.extra or {})}
+        extra.update(
+            self._combine_tps_extras(
+                a.extra or {},
+                b.extra or {},
+                total_completion_tokens=c,
+            )
+        )
+        extra = extra or None
+        return Metrics(
+            prompt_tokens=p,
+            completion_tokens=c,
+            cached_tokens=cache,
+            cost_usd=cost,
+            extra=extra,
+        )
+
+    def _allocate_records_to_steps(
+        self,
+        steps: list[Step],
+        turns: list[dict[str, Any]],
+        records_for_traj: list[dict[str, Any]],
+    ) -> None:
+        """Attach a `Metrics` object to the first assistant-source step of the
+        round whose timestamp is nearest the record timestamp (per design
+        decision Q5). Records that cannot be matched to a round in their turn
+        fall through to the last assistant-source step of the turn.
+        """
+        if not records_for_traj:
+            return
+
+        first_step_by_round: dict[tuple[str, str], Step] = {}
+        last_agent_step_by_turn: dict[str, Step] = {}
+        for step in steps:
+            if step.source != "agent":
+                continue
+            extra = step.extra or {}
+            turn_id = extra.get("turn_id")
+            round_id = extra.get("round_id")
+            if isinstance(turn_id, str):
+                last_agent_step_by_turn[turn_id] = step
+            if (
+                isinstance(turn_id, str)
+                and isinstance(round_id, str)
+                and (turn_id, round_id) not in first_step_by_round
+            ):
+                first_step_by_round[(turn_id, round_id)] = step
+
+        records_by_turn: dict[str, list[dict[str, Any]]] = {}
+        for rec in records_for_traj:
+            tid = rec.get("turn_id")
+            if isinstance(tid, str):
+                records_by_turn.setdefault(tid, []).append(rec)
+
+        for turn in turns:
+            turn_id = turn.get("turnId")
+            if not isinstance(turn_id, str):
+                continue
+            turn_records = records_by_turn.get(turn_id, [])
+            if not turn_records:
+                continue
+            rounds = list(turn.get("modelRounds") or [])
+            if not rounds:
+                target = last_agent_step_by_turn.get(turn_id)
+                if target is None:
+                    continue
+                for rec in turn_records:
+                    new_m = self._build_metrics_from_record(rec)
+                    if target.metrics is None:
+                        target.metrics = new_m
+                    else:
+                        target.metrics = self._merge_metrics(target.metrics, new_m)
+                continue
+
+            round_targets: list[Step | None] = []
+            for rnd in rounds:
+                key = (turn_id, rnd.get("id"))
+                step = first_step_by_round.get(key)
+                if step is not None:
+                    round_targets.append(step)
+                else:
+                    round_targets.append(last_agent_step_by_turn.get(turn_id))
+
+            round_ts = [rnd.get("timestamp") or 0 for rnd in rounds]
+            for rec in turn_records:
+                rec_ts = self._parse_record_ts_ms(rec) or 0
+                best_idx = min(
+                    range(len(round_ts)),
+                    key=lambda i: abs(round_ts[i] - rec_ts),
+                )
+                target = round_targets[best_idx] or last_agent_step_by_turn.get(turn_id)
+                if target is None:
+                    continue
+                new_m = self._build_metrics_from_record(rec)
+                if target.metrics is None:
+                    target.metrics = new_m
+                else:
+                    target.metrics = self._merge_metrics(target.metrics, new_m)
+
+    def _build_final_tps_extra(
+        self, records_for_traj: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Aggregate trajectory-level TPS over the records of one trajectory.
+
+        ``records_for_traj`` is already scoped to this trajectory's
+        ``is_subagent`` value by ``_convert_events_to_trajectory``, so this
+        computes the summary over whichever scope (main or subagent) the
+        trajectory represents — keeping the summary consistent with the
+        step-level TPS attached in ``_build_metrics_from_record``.
+        """
+        if not records_for_traj:
+            return {}
+
+        total_completion = 0
+        covered_completion = 0
+        total_latency = 0
+        covered_calls = 0
+        saw_zero_latency = False
+        saw_missing_latency = False
+
+        for record in records_for_traj:
+            completion = int(record.get("output_tokens") or 0)
+            total_completion += completion
+            latency, reason = self._parse_llm_latency_ms(record)
+            if latency and latency > 0:
+                covered_completion += completion
+                total_latency += latency
+                covered_calls += 1
+            elif reason == "zero_latency":
+                saw_zero_latency = True
+            else:
+                saw_missing_latency = True
+
+        extra: dict[str, Any] = {}
+        if total_latency > 0:
+            extra["total_llm_latency_ms"] = total_latency
+            extra["model_call_count"] = covered_calls
+            extra["tps_completion_tokens"] = covered_completion
+            extra["completion_tokens_per_second"] = round(
+                covered_completion * 1000.0 / total_latency, 2
+            )
+            extra["tps_latency_coverage"] = (
+                "complete" if covered_completion == total_completion else "partial"
+            )
+        elif saw_zero_latency:
+            extra["total_llm_latency_ms"] = 0
+            extra["tps_unavailable_reason"] = "zero_latency"
+        elif saw_missing_latency:
+            extra["tps_unavailable_reason"] = "missing_latency"
+        return extra
+
+    def _build_final_metrics(
+        self,
+        steps: list[Step],
+        metadata: dict[str, Any],
+        records_for_traj: list[dict[str, Any]],
+        subagent_trajectories: list[Trajectory],
+        subagent_count: int,
+        turns: list[dict[str, Any]] | None = None,
+    ) -> FinalMetrics:
+        prompt = 0
+        completion = 0
+        cached = 0
+        has_any = False
+        cost_total: float = 0.0
+        every_step_priced = True
+        for step in steps:
+            if step.metrics is None:
+                continue
+            has_any = True
+            prompt += step.metrics.prompt_tokens or 0
+            completion += step.metrics.completion_tokens or 0
+            cached += step.metrics.cached_tokens or 0
+            if step.metrics.cost_usd is None:
+                every_step_priced = False
+            else:
+                cost_total += step.metrics.cost_usd
+
+        # When no token_usage records exist (typical for subagents), fall back
+        # to tokenDetails embedded in each modelRound.
+        has_cached_from_details = False
+        if not has_any and turns:
+            for turn in turns:
+                for rnd in turn.get("modelRounds") or []:
+                    td = rnd.get("tokenDetails") or {}
+                    cached_count = td.get("cachedContentTokenCount")
+                    if isinstance(cached_count, int):
+                        cached += cached_count
+                        has_cached_from_details = True
+
+        total_cost = cost_total if (has_any and every_step_priced) else None
+
+        duration_ms: int | None = None
+        if isinstance(metadata.get("createdAt"), int) and isinstance(
+            metadata.get("lastActiveAt"), int
+        ):
+            duration_ms = metadata["lastActiveAt"] - metadata["createdAt"]
+
+        models_used = sorted(
+            {
+                rec["model_id"]
+                for rec in records_for_traj
+                if isinstance(rec.get("model_id"), str)
+            }
+        )
+        subagent_total_tokens = 0
+        for subagent in subagent_trajectories:
+            fm = subagent.final_metrics
+            if fm is None:
+                continue
+            subagent_total_tokens += (fm.total_prompt_tokens or 0) + (
+                fm.total_completion_tokens or 0
+            )
+
+        extra_fields: dict[str, Any] = {
+            "main_session_tool_calls": metadata.get("toolCallCount"),
+            "main_session_turn_count": metadata.get("turnCount"),
+            "main_session_duration_ms": duration_ms,
+            "models_used": models_used or None,
+            "subagent_session_count": subagent_count or None,
+            "subagent_total_tokens": subagent_total_tokens or None,
+        }
+        extra_fields.update(self._build_final_tps_extra(records_for_traj))
+        extra: dict[str, Any] | None = {
+            k: v for k, v in extra_fields.items() if v is not None
+        } or None
+
+        return FinalMetrics(
+            total_prompt_tokens=prompt if has_any else None,
+            total_completion_tokens=completion if has_any else None,
+            total_cached_tokens=cached
+            if (has_any or has_cached_from_details)
+            else None,
+            total_cost_usd=total_cost,
+            total_steps=len(steps),
+            extra=extra,
+        )
+
+    def _apply_stdout_token_stats_fallback(
+        self,
+        final_metrics: FinalMetrics,
+        *,
+        is_subagent: bool,
+        steps: list[Step] | None = None,
+    ) -> None:
+        """Fill final metrics from stdout totals when structured records are absent."""
+        if is_subagent or final_metrics.total_prompt_tokens is not None:
+            return
+
+        stats = self._load_stdout_token_stats()
+        if not stats:
+            return
+
+        prompt = int(stats["prompt_tokens"])
+        completion = int(stats["completion_tokens"])
+        cached = stats["cached_tokens"]
+        cost = (
+            self._compute_cost_via_litellm(
+                None,
+                prompt,
+                cached,
+                completion,
+            )
+            if cached is not None and stats["cached_tokens_coverage"] == "true"
+            else None
+        )
+
+        final_metrics.total_prompt_tokens = prompt
+        final_metrics.total_completion_tokens = completion
+        final_metrics.total_cached_tokens = cached
+        final_metrics.total_cost_usd = cost
+
+        extra = dict(final_metrics.extra or {})
+        extra.update(
+            {
+                "token_usage_source": "bitfun_stdout",
+                "stdout_token_stats_count": stats["record_count"],
+                "stdout_total_tokens": stats["total_tokens"],
+                "cached_tokens_available": stats["cached_tokens_available"],
+                "cached_tokens_coverage": stats["cached_tokens_coverage"],
+            }
+        )
+        final_metrics.extra = extra
+
+        if steps:
+            target = next(
+                (step for step in reversed(steps) if step.source == "agent"), None
+            )
+            if target is not None and target.metrics is None:
+                target.metrics = Metrics(
+                    prompt_tokens=prompt,
+                    completion_tokens=completion,
+                    cached_tokens=cached,
+                    cost_usd=cost,
+                    extra={
+                        "token_usage_source": "bitfun_stdout",
+                        "allocation": "aggregate_attached_to_last_agent_step",
+                        "stdout_token_stats_count": stats["record_count"],
+                        "stdout_total_tokens": stats["total_tokens"],
+                        "cached_tokens_available": stats["cached_tokens_available"],
+                        "cached_tokens_coverage": stats["cached_tokens_coverage"],
+                    },
+                )
+
+    @staticmethod
+    def _sum_trajectory_token_counts(
+        trajectory: Trajectory,
+    ) -> tuple[int, int, int | None, float | None]:
+        """Sum main-session metrics plus direct BitFun task subagents."""
+        prompt = 0
+        completion = 0
+        cached = 0
+        has_cached = False
+        cost = 0.0
+        has_cost = False
+        all_metrics_priced = True
+
+        for current in [trajectory, *(trajectory.subagent_trajectories or [])]:
+            fm = current.final_metrics
+            if fm is not None:
+                prompt += fm.total_prompt_tokens or 0
+                completion += fm.total_completion_tokens or 0
+                if fm.total_cached_tokens is not None:
+                    has_cached = True
+                    cached += fm.total_cached_tokens
+                if fm.total_cost_usd is None:
+                    all_metrics_priced = False
+                else:
+                    has_cost = True
+                    cost += fm.total_cost_usd
+
+        return (
+            prompt,
+            completion,
+            cached if has_cached else None,
+            cost if has_cost and all_metrics_priced else None,
+        )
+
+    def _embed_subagents(
+        self,
+        *,
+        steps: list[Step],
+        session_dir: Path,
+        token_records: list[dict[str, Any]],
+        into: list[Trajectory],
+        missing: set[str],
+    ) -> int:
+        """Walk tool steps, deduplicate by subagent session id, and embed each.
+
+        For every distinct `subagentSessionId` referenced from this trajectory:
+          1. Locate `<sessions_root>/<sid>/`. If missing, record it in `missing`
+             and strip any tentative `subagent_trajectory_ref` from the parent
+             observation pointing at this sid.
+          2. Build a direct subagent Trajectory and set `trajectory_id`.
+             Override `agent.name` with the dispatch tool name and
+             `agent.model_name` with `toolItem.subagentModelId` when present.
+          3. Append to `into`.
+        Returns the number of trajectories embedded.
+        """
+        sessions_root = session_dir.parent
+        self._attach_subagent_refs_from_metadata(steps=steps, session_dir=session_dir)
+
+        refs_by_sid: dict[
+            str,
+            list[tuple[Step, ObservationResult, SubagentTrajectoryRef]],
+        ] = {}
+        for step in steps:
+            if step.observation is None:
+                continue
+            for result in step.observation.results:
+                for ref in result.subagent_trajectory_ref or []:
+                    if not ref.trajectory_id:
+                        continue
+                    refs_by_sid.setdefault(ref.trajectory_id, []).append(
+                        (step, result, ref)
+                    )
+
+        if not refs_by_sid:
+            return 0
+
+        embedded = 0
+        for sub_sid, refs in refs_by_sid.items():
+            sub_dir = sessions_root / sub_sid
+            if not (sub_dir / "metadata.json").is_file():
+                missing.add(sub_sid)
+                for _step, result, ref in refs:
+                    if result.subagent_trajectory_ref:
+                        remaining = [
+                            r for r in result.subagent_trajectory_ref if r is not ref
+                        ]
+                        result.subagent_trajectory_ref = remaining or None
+                continue
+
+            try:
+                sub_traj = self._convert_events_to_trajectory(
+                    sub_dir, is_subagent=True, token_records=token_records
+                )
+            except Exception:
+                self.logger.exception("Failed to embed BitFun subagent %s", sub_sid)
+                sub_traj = None
+
+            if sub_traj is None:
+                missing.add(sub_sid)
+                for _step, result, ref in refs:
+                    if result.subagent_trajectory_ref:
+                        remaining = [
+                            r for r in result.subagent_trajectory_ref if r is not ref
+                        ]
+                        result.subagent_trajectory_ref = remaining or None
+                continue
+
+            sub_traj.trajectory_id = sub_sid
+            tool_name = None
+            model_override = None
+            for _step, _result, ref in refs:
+                rex = ref.extra or {}
+                tool_name = tool_name or rex.get("tool_name")
+                model_override = model_override or rex.get("subagent_model_id")
+            if tool_name:
+                sub_traj.agent.name = tool_name
+            if model_override:
+                sub_traj.agent.model_name = model_override
+            agent_extra = dict(sub_traj.agent.extra or {})
+            first_extra = refs[0][2].extra or {}
+            if first_extra.get("tool_call_id"):
+                agent_extra["parent_task_tool_id"] = first_extra["tool_call_id"]
+            sub_traj.agent.extra = agent_extra or None
+
+            into.append(sub_traj)
+            embedded += 1
+
+        return embedded
+
+    @staticmethod
+    def _load_session_metadata(session_dir: Path) -> dict[str, Any] | None:
+        meta_path = session_dir / "metadata.json"
+        if not meta_path.is_file():
+            return None
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        return metadata if isinstance(metadata, dict) else None
+
+    def _attach_subagent_refs_from_metadata(
+        self, *, steps: list[Step], session_dir: Path
+    ) -> int:
+        """Backfill subagent refs from child metadata relationship fields.
+
+        Newer BitFun session exports can store the parent-child link only on the
+        child session's metadata.relationship block instead of duplicating the
+        child id on the parent tool item as subagentSessionId.
+        """
+        parent_metadata = self._load_session_metadata(session_dir) or {}
+        parent_session_id = parent_metadata.get("sessionId") or session_dir.name
+        sessions_root = session_dir.parent
+        if not sessions_root.is_dir():
+            return 0
+
+        targets_by_call_id: dict[str, list[tuple[Step, ObservationResult]]] = {}
+        fallback_steps_by_call_id: dict[str, list[Step]] = {}
+        existing_ref_ids: set[str] = set()
+
+        for step in steps:
+            for tool_call in step.tool_calls or []:
+                fallback_steps_by_call_id.setdefault(tool_call.tool_call_id, []).append(
+                    step
+                )
+            if step.observation is None:
+                continue
+            for result in step.observation.results:
+                for ref in result.subagent_trajectory_ref or []:
+                    if ref.trajectory_id:
+                        existing_ref_ids.add(ref.trajectory_id)
+                if result.source_call_id:
+                    targets_by_call_id.setdefault(result.source_call_id, []).append(
+                        (step, result)
+                    )
+
+        attached = 0
+        for sub_dir in sessions_root.iterdir():
+            if not sub_dir.is_dir() or sub_dir == session_dir:
+                continue
+            metadata = self._load_session_metadata(sub_dir)
+            if not metadata or metadata.get("sessionKind") != "subagent":
+                continue
+
+            relationship = metadata.get("relationship")
+            if not isinstance(relationship, dict):
+                continue
+            if relationship.get("kind") not in (None, "subagent"):
+                continue
+
+            rel_parent_sid = relationship.get("parentSessionId")
+            if rel_parent_sid != parent_session_id:
+                continue
+
+            parent_tool_call_id = relationship.get("parentToolCallId")
+            if not parent_tool_call_id:
+                continue
+
+            sub_sid = metadata.get("sessionId") or sub_dir.name
+            if sub_sid in existing_ref_ids:
+                continue
+
+            targets = list(targets_by_call_id.get(parent_tool_call_id) or [])
+            if not targets:
+                for step in fallback_steps_by_call_id.get(parent_tool_call_id) or []:
+                    if step.observation and step.observation.results:
+                        targets.append((step, step.observation.results[0]))
+            if not targets:
+                continue
+
+            subagent_type = relationship.get("subagentType") or metadata.get(
+                "agentType"
+            )
+            ref = SubagentTrajectoryRef(
+                trajectory_id=sub_sid,
+                session_id=sub_sid,
+                extra={
+                    "tool_call_id": parent_tool_call_id,
+                    "tool_name": subagent_type or "Task",
+                    "subagent_model_id": metadata.get("modelName"),
+                    "relationship_source": "metadata",
+                },
+            )
+
+            for step, result in targets:
+                refs = list(result.subagent_trajectory_ref or [])
+                if not any(r.trajectory_id == sub_sid for r in refs):
+                    refs.append(ref)
+                    result.subagent_trajectory_ref = refs
+                    step_extra = dict(step.extra or {})
+                    step_extra["is_subagent_dispatch"] = True
+                    step_extra["subagent_relationship_source"] = "metadata"
+                    step.extra = step_extra
+                    attached += 1
+
+            existing_ref_ids.add(sub_sid)
+
+        return attached
+
+    def _convert_events_to_trajectory(
+        self,
+        session_dir: Path,
+        *,
+        is_subagent: bool = False,
+        token_records: list[dict[str, Any]] | None = None,
+    ) -> Trajectory | None:
+        """Convert one BitFun session into an ATIF Trajectory.
+
+        When `is_subagent=True`, the resulting trajectory is meant to be embedded
+        in a parent's `subagent_trajectories[]`; the caller is responsible for
+        setting `trajectory_id` after this method returns.
+        """
+        meta_path = session_dir / "metadata.json"
+        if not meta_path.is_file():
+            self.logger.debug(f"No metadata.json in {session_dir}")
+            return None
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            self.logger.debug(f"Failed to parse {meta_path}: {exc}")
+            return None
+
+        session_id: str = metadata.get("sessionId") or session_dir.name
+        default_model_name = metadata.get("modelName") or self.model_name
+
+        turns = self._load_turns_preferring_snapshot(session_dir)
+
+        steps: list[Step] = []
+        next_step_id = 1
+        for turn in turns:
+            kind = turn.get("kind", "user_dialog")
+            if kind == "local_command":
+                continue
+            if kind == "manual_compaction":
+                steps.append(
+                    Step(
+                        step_id=next_step_id,
+                        timestamp=self._ts_iso(turn.get("timestamp")),
+                        source="system",
+                        message="<manual compaction>",
+                        is_copied_context=True,
+                        extra={
+                            "turn_id": turn.get("turnId"),
+                            "turn_index": turn.get("turnIndex"),
+                            "turn_kind": "manual_compaction",
+                        },
+                    )
+                )
+                next_step_id += 1
+                continue
+
+            user_msg = turn.get("userMessage") or {}
+            user_text = self._user_text_from_message(user_msg)
+            steps.append(
+                Step(
+                    step_id=next_step_id,
+                    timestamp=self._ts_iso(
+                        user_msg.get("timestamp") or turn.get("timestamp")
+                    ),
+                    source="user",
+                    message=user_text,
+                    extra={
+                        "turn_id": turn.get("turnId"),
+                        "turn_index": turn.get("turnIndex"),
+                        "turn_kind": kind,
+                        "user_message_id": user_msg.get("id"),
+                    },
+                )
+            )
+            next_step_id += 1
+
+            for rnd in turn.get("modelRounds") or []:
+                new_steps, next_step_id = self._round_to_steps(
+                    rnd,
+                    turn,
+                    next_step_id,
+                    default_model_name=default_model_name,
+                )
+                steps.extend(new_steps)
+
+        if not steps:
+            self.logger.debug(f"No steps produced from BitFun session {session_id}")
+            return None
+
+        if token_records is None:
+            token_records = self._load_token_records()
+
+        records_for_traj = [
+            rec
+            for rec in token_records
+            if rec.get("session_id") == session_id
+            and bool(rec.get("is_subagent")) == is_subagent
+        ]
+        self._allocate_records_to_steps(steps, turns, records_for_traj)
+
+        subagent_trajectories: list[Trajectory] = []
+        missing_subagents: set[str] = set()
+        if not is_subagent:
+            embed_count = self._embed_subagents(
+                steps=steps,
+                session_dir=session_dir,
+                token_records=token_records,
+                into=subagent_trajectories,
+                missing=missing_subagents,
+            )
+        else:
+            embed_count = 0
+
+        notes: str | None = None
+        if missing_subagents:
+            notes = (
+                "Subagent session(s) referenced but missing from cp-back: "
+                + ", ".join(sorted(missing_subagents))
+            )
+
+        agent_fields: dict[str, Any] = {
+            "agent_type": metadata.get("agentType"),
+            "session_kind": metadata.get("sessionKind"),
+            "workspace_path": metadata.get("workspacePath"),
+            "schema_version": metadata.get("schema_version"),
+        }
+        agent_extra: dict[str, Any] | None = {
+            k: v for k, v in agent_fields.items() if v is not None
+        } or None
+
+        final_metrics = self._build_final_metrics(
+            steps=steps,
+            metadata=metadata,
+            records_for_traj=records_for_traj,
+            subagent_trajectories=subagent_trajectories,
+            subagent_count=embed_count,
+            turns=turns,
+        )
+        self._apply_stdout_token_stats_fallback(
+            final_metrics,
+            is_subagent=is_subagent,
+            steps=steps,
+        )
+
+        trajectory = Trajectory(
+            schema_version=_ATIF_SCHEMA_VERSION,
+            session_id=session_id,
+            agent=Agent(
+                name="bitfun-cli",
+                version=self.version() or "unknown",
+                model_name=default_model_name,
+                extra=agent_extra,
+            ),
+            steps=steps,
+            final_metrics=final_metrics,
+            subagent_trajectories=subagent_trajectories or None,
+            notes=notes,
+        )
+        return trajectory
+
+    def populate_context_post_run(self, context: AgentContext) -> None:
+        session_dir = self._get_session_dir()
+        if not session_dir:
+            self.logger.debug("No BitFun session directory found")
+            return
+        try:
+            trajectory = self._convert_events_to_trajectory(session_dir)
+        except Exception:
+            self.logger.exception("Failed to convert BitFun events to trajectory")
+            return
+        if not trajectory:
+            return
+
+        trajectory_path = self.logs_dir / "trajectory.json"
+        try:
+            trajectory_path.write_text(
+                format_trajectory_json(trajectory.to_json_dict())
+            )
+            self.logger.debug(f"Wrote BitFun trajectory to {trajectory_path}")
+        except OSError as exc:
+            self.logger.debug(
+                f"Failed to write trajectory file {trajectory_path}: {exc}"
+            )
+
+        if trajectory.final_metrics:
+            fm = trajectory.final_metrics
+            prompt, completion, cached, cost = self._sum_trajectory_token_counts(
+                trajectory
+            )
+            context.cost_usd = cost
+            context.n_input_tokens = prompt
+            context.n_cache_tokens = cached
+            context.n_output_tokens = completion
+            bitfun_metadata: dict[str, Any] = {
+                "trajectory_path": "agent/trajectory.json",
+                "session_id": trajectory.session_id,
+                "agent_version": trajectory.agent.version,
+                "model_name": trajectory.agent.model_name,
+                "total_steps": fm.total_steps,
+            }
+            artifact_paths = {
+                "bitfun_data_path": (
+                    self.logs_dir / _BITFUN_DATA_SUBDIR,
+                    "agent/bitfun",
+                ),
+                "cli_log_path": (
+                    self.logs_dir / _BITFUN_DATA_SUBDIR / "cli.log",
+                    "agent/bitfun/cli.log",
+                ),
+                "ai_request_audit_path": (
+                    self.logs_dir / _BITFUN_DATA_SUBDIR / "ai-request-audit.jsonl",
+                    "agent/bitfun/ai-request-audit.jsonl",
+                ),
+                "cli_logs_path": (
+                    self.logs_dir / _BITFUN_DATA_SUBDIR / "cli-logs",
+                    "agent/bitfun/cli-logs",
+                ),
+                "request_traces_path": (
+                    self.logs_dir / _BITFUN_DATA_SUBDIR / "request-traces",
+                    "agent/bitfun/request-traces",
+                ),
+                "cp_back_manifest_path": (
+                    self.logs_dir / _BITFUN_DATA_SUBDIR / "cp-back-manifest.json",
+                    "agent/bitfun/cp-back-manifest.json",
+                ),
+                "final_app_config_path": (
+                    self.logs_dir
+                    / _BITFUN_DATA_SUBDIR
+                    / "config"
+                    / "app.redacted.json",
+                    _APP_CONFIG_REDACTED_ARTIFACT_PATH,
+                ),
+            }
+            for key, (path, artifact_path) in artifact_paths.items():
+                if path.exists():
+                    bitfun_metadata[key] = artifact_path
+            if fm.extra:
+                for key in (
+                    "token_usage_source",
+                    "stdout_token_stats_count",
+                    "stdout_total_tokens",
+                    "cached_tokens_available",
+                    "cached_tokens_coverage",
+                ):
+                    if key in fm.extra:
+                        bitfun_metadata[key] = fm.extra[key]
+            metadata = dict(context.metadata or {})
+            metadata["bitfun"] = {
+                k: v for k, v in bitfun_metadata.items() if v is not None
+            }
+            context.metadata = metadata
+
+    async def _exec(
+        self,
+        environment: BaseEnvironment,
+        command: str,
+        user: str | int | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        timeout_sec: int | None = None,
+    ) -> Any:
+        merged_env = env
+        if self._extra_env:
+            merged_env = dict(env) if env else {}
+            merged_env.update(self._extra_env)
+
+        self.logger.debug(
+            f"Running command: {command}",
+            extra={"user": str(user), "env": merged_env or {}},
+        )
+
+        result = await environment.exec(
+            command=f"set -o pipefail; {command}",
+            user=user,
+            env=merged_env,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+        )
+        if result.return_code != 0:
+            try:
+                await environment.prepare_logs_for_host()
+            except Exception as exc:
+                self.logger.warning(
+                    f"Failed to prepare BitFun logs before persisting failure output: {exc}"
+                )
+            try:
+                self._persist_failure_output(result.stdout, result.stderr)
+            except OSError as exc:
+                self.logger.warning(f"Failed to persist BitFun failure output: {exc}")
+            self.logger.debug(
+                "Command failed",
+                extra={
+                    "return_code": result.return_code,
+                    "stdout": self._truncate_output(result.stdout),
+                    "stderr": self._truncate_output(result.stderr),
+                },
+            )
+            raise NonZeroAgentExitCodeError(
+                f"Command failed (exit {result.return_code}): {command}\n"
+                f"stdout: {self._truncate_output(result.stdout)}\n"
+                f"stderr: {self._truncate_output(result.stderr)}"
+            )
+
+        self.logger.debug(
+            "Command outputs captured",
+            extra={
+                "stdout": self._truncate_output(result.stdout),
+                "stderr": self._truncate_output(result.stderr),
+            },
+        )
+        return result
+
+    def _build_run_shell(self, instruction: str) -> str:
+        bp = shlex.quote(self._binary_path)
+        msg = shlex.quote(instruction)
+        agent_flag = shlex.quote(self._exec_agent)
+        patch_part = ""
+        patch_setup = ""
+        if self._output_patch_path:
+            patch_q = shlex.quote(self._output_patch_path)
+            patch_part = f" --output-patch {patch_q}"
+            patch_setup = (
+                f"PATCH_PATH={patch_q}\n"
+                'mkdir -p "$(dirname "$PATCH_PATH")" 2>/dev/null || true\n'
+            )
+        return (
+            "set -o pipefail\n"
+            "mkdir -p /logs/agent\n"
+            "if command -v stdbuf >/dev/null 2>&1; then\n"
+            f"  bitfun_tee() {{ stdbuf -oL tee {_AGENT_LOG}; }}\n"
+            "else\n"
+            f"  bitfun_tee() {{ tee {_AGENT_LOG}; }}\n"
+            "fi\n"
+            f"{patch_setup}"
+            f"{bp} exec --agent {agent_flag}{patch_part} -- {msg} "
+            "2>&1 | bitfun_tee\n"
+            "rc=${PIPESTATUS[0]}\n"
+            "exit $rc"
+        )
+
+    def _build_register_config_command(self) -> str | None:
+        if self._bitfun_config is None:
+            return None
+
+        config_json = json.dumps(self._bitfun_config, indent=2)
+        escaped = shlex.quote(config_json)
+        return (
+            _bitfun_config_root_shell()
+            + 'mkdir -p "$BITFUN_CONFIG_ROOT/config"\n'
+            + f"printf '%s\\n' {escaped} > \"$BITFUN_CONFIG_ROOT/config/app.json\""
+        )
+
+    def _build_app_config_probe_command(self) -> str:
+        return (
+            _bitfun_config_root_shell()
+            + 'APP_CONFIG_SRC="$BITFUN_CONFIG_ROOT/config/app.json"\n'
+            + 'printf "source=%s\\n" "$APP_CONFIG_SRC"\n'
+            + 'if [ -f "$APP_CONFIG_SRC" ]; then\n'
+            + '  printf "exists=true\\n"\n'
+            + '  printf "size_bytes=%s\\n" "$(wc -c < "$APP_CONFIG_SRC" 2>/dev/null || printf 0)"\n'
+            + "else\n"
+            + '  printf "exists=false\\n"\n'
+            + '  printf "size_bytes=0\\n"\n'
+            + "fi\n"
+        )
+
+    @staticmethod
+    def _is_sensitive_config_key(key: str) -> bool:
+        normalized = key.lower().replace("-", "_").replace(" ", "_")
+        return normalized in _SENSITIVE_CONFIG_KEYS or normalized.endswith(
+            _SENSITIVE_CONFIG_SUFFIXES
+        )
+
+    @classmethod
+    def _redact_config_secrets(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: _REDACTED_CONFIG_VALUE
+                if isinstance(key, str) and cls._is_sensitive_config_key(key)
+                else cls._redact_config_secrets(child)
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._redact_config_secrets(item) for item in value]
+        return value
+
+    @staticmethod
+    def _parse_app_config_probe_output(stdout: str | None) -> dict[str, str]:
+        parsed: dict[str, str] = {}
+        for line in (stdout or "").splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                parsed[key.strip()] = value
+        return parsed
+
+    @staticmethod
+    def _probe_size_bytes(probe: dict[str, str]) -> int:
+        try:
+            return int(probe.get("size_bytes") or 0)
+        except ValueError:
+            return 0
+
+    def _new_app_config_capture_temp_path(self, suffix: str) -> Path:
+        self.logs_dir.parent.mkdir(parents=True, exist_ok=True)
+        fd, path = tempfile.mkstemp(
+            prefix=".bitfun-app-config-",
+            suffix=suffix,
+            dir=self.logs_dir.parent,
+        )
+        os.close(fd)
+        return Path(path)
+
+    async def _upload_app_config_capture_manifest(
+        self,
+        environment: BaseEnvironment,
+        app_config: dict[str, Any],
+        temp_paths: list[Path],
+    ) -> None:
+        current_manifest = self._new_app_config_capture_temp_path(".manifest.json")
+        updated_manifest = self._new_app_config_capture_temp_path(
+            ".manifest.updated.json"
+        )
+        temp_paths.extend([current_manifest, updated_manifest])
+
+        manifest: dict[str, Any] = {}
+        try:
+            await environment.download_file(
+                _REMOTE_CP_BACK_MANIFEST_PATH,
+                current_manifest,
+            )
+            loaded = json.loads(current_manifest.read_text())
+            if isinstance(loaded, dict):
+                manifest = loaded
+        except Exception as exc:
+            self.logger.debug(
+                "BitFun final app config: could not load existing manifest: %s",
+                exc,
+            )
+
+        manifest["app_config"] = app_config
+        updated_manifest.write_text(json.dumps(manifest, indent=2) + "\n")
+        await environment.upload_file(updated_manifest, _REMOTE_CP_BACK_MANIFEST_PATH)
+
+    async def _capture_final_app_config(self, environment: BaseEnvironment) -> None:
+        app_config: dict[str, Any] = {
+            "source": None,
+            "exists": False,
+            "size_bytes": 0,
+            "target": None,
+            "redacted": False,
+            "raw_saved": False,
+            "capture_error": None,
+        }
+        temp_paths: list[Path] = []
+
+        try:
+            probe_result = await environment.exec(
+                command=f"set -o pipefail; {self._build_app_config_probe_command()}",
+                env=self._env_for_run(),
+            )
+            if probe_result.return_code != 0:
+                raise RuntimeError(f"probe failed with exit {probe_result.return_code}")
+
+            probe = self._parse_app_config_probe_output(probe_result.stdout)
+            source = probe.get("source") or None
+            exists = probe.get("exists") == "true"
+            app_config.update(
+                {
+                    "source": source,
+                    "exists": exists,
+                    "size_bytes": self._probe_size_bytes(probe),
+                }
+            )
+
+            if exists:
+                if source is None:
+                    raise RuntimeError("app config probe did not return source")
+
+                raw_path = self._new_app_config_capture_temp_path(".raw.json")
+                redacted_path = self._new_app_config_capture_temp_path(".redacted.json")
+                temp_paths.extend([raw_path, redacted_path])
+
+                await environment.download_file(source, raw_path)
+                try:
+                    raw_config = json.loads(raw_path.read_text())
+                except json.JSONDecodeError:
+                    app_config["capture_error"] = "invalid JSON"
+                else:
+                    redacted_config = self._redact_config_secrets(raw_config)
+                    redacted_path.write_text(
+                        json.dumps(redacted_config, indent=2) + "\n"
+                    )
+                    mkdir_result = await environment.exec(
+                        command=f"mkdir -p {shlex.quote(_REMOTE_BITFUN_CONFIG_DIR)}",
+                        env=self._env_for_run(),
+                    )
+                    if mkdir_result.return_code != 0:
+                        raise RuntimeError(
+                            f"mkdir failed with exit {mkdir_result.return_code}"
+                        )
+                    await environment.upload_file(
+                        redacted_path,
+                        _REMOTE_APP_CONFIG_REDACTED_PATH,
+                    )
+                    app_config.update(
+                        {
+                            "target": _APP_CONFIG_REDACTED_ARTIFACT_PATH,
+                            "redacted": True,
+                        }
+                    )
+        except Exception as exc:
+            if app_config["capture_error"] is None:
+                app_config["capture_error"] = str(exc)
+            self.logger.debug("BitFun final app config capture failed: %s", exc)
+        finally:
+            try:
+                await self._upload_app_config_capture_manifest(
+                    environment,
+                    app_config,
+                    temp_paths,
+                )
+            except Exception as exc:
+                self.logger.debug(
+                    "BitFun final app config manifest update failed: %s",
+                    exc,
+                )
+            for path in temp_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    self.logger.debug(
+                        "BitFun final app config temp cleanup failed for %s: %s",
+                        path,
+                        exc,
+                    )
+
+    def _persist_failure_output(self, stdout: str | None, stderr: str | None) -> None:
+        parts: list[str] = []
+        if stdout:
+            parts.append(stdout)
+        if stderr:
+            if parts:
+                parts.append("\n--- stderr ---\n")
+            parts.append(stderr)
+        if not parts:
+            return
+        body = _format_failure_log_text("".join(parts))
+        path = self.logs_dir / "bitfun.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, errors="replace")
+
+    def _log_cp_back_gaps(self) -> None:
+        cli_log = self.logs_dir / _BITFUN_DATA_SUBDIR / "cli.log"
+        if not cli_log.is_file():
+            self.logger.debug("BitFun cp-back: missing cli.log at %s", cli_log)
+        elif cli_log.stat().st_size == 0:
+            self.logger.debug("BitFun cp-back: empty cli.log at %s", cli_log)
+        audit_log = self.logs_dir / _BITFUN_DATA_SUBDIR / "ai-request-audit.jsonl"
+        if not audit_log.is_file():
+            self.logger.debug(
+                "BitFun cp-back: missing ai-request-audit.jsonl at %s",
+                audit_log,
+            )
+        request_traces_root = self.logs_dir / _BITFUN_DATA_SUBDIR / "request-traces"
+        if not request_traces_root.is_dir():
+            self.logger.debug(
+                "BitFun cp-back: missing request-traces directory at %s",
+                request_traces_root,
+            )
+        sessions_root = self.logs_dir / _BITFUN_DATA_SUBDIR / "sessions"
+        if not sessions_root.is_dir():
+            self.logger.debug(
+                "BitFun cp-back: missing sessions directory at %s",
+                sessions_root,
+            )
+            return
+        session_dirs = [p for p in sessions_root.iterdir() if p.is_dir()]
+        if not session_dirs:
+            self.logger.debug(
+                "BitFun cp-back: no session subdirectories under %s",
+                sessions_root,
+            )
+
+    def _cp_back_command(self) -> str:
+        command = _CP_BACK_COMMAND
+        if self._output_patch_path:
+            patch_path = shlex.quote(self._output_patch_path)
+            meta_path = shlex.quote(f"{self._output_patch_path}.meta.json")
+            command += f"""\
+PATCH_PATH={patch_path}
+PATCH_META_PATH={meta_path}
+mkdir -p "$(dirname "$PATCH_PATH")" 2>/dev/null || true
+if [ -f "$PATCH_PATH" ]; then
+  printf '%s\\n' '{{"present":true,"created_empty_placeholder":false}}' > "$PATCH_META_PATH" 2>/dev/null || true
+else
+  : > "$PATCH_PATH" 2>/dev/null || true
+  printf '%s\\n' '{{"present":false,"created_empty_placeholder":true}}' > "$PATCH_META_PATH" 2>/dev/null || true
+fi
+"""
+        return command + "exit 0\n"
+
+    def _env_for_run(self) -> dict[str, str]:
+        env: dict[str, str] = {}
+        for key in _ENV_PASSTHROUGH:
+            val = os.environ.get(key)
+            if val:
+                env[key] = val
+        for key, val in os.environ.items():
+            if key.startswith("BITFUN_") and val:
+                env[key] = val
+        env.update(self._extra_env)
+        return env
+
+    async def _capture_repo_baseline(self, environment: BaseEnvironment) -> None:
+        await self.exec_as_root(
+            environment,
+            command=f"mkdir -p {shlex.quote(self._patch_logs_dir_in_env.as_posix())}",
+        )
+        await self.exec_as_agent(
+            environment,
+            command=build_repo_baseline_capture_script(
+                self._patch_logs_dir_in_env.as_posix()
+            ),
+        )
+
+    async def _capture_repo_final_state(self, environment: BaseEnvironment) -> None:
+        await self.exec_as_agent(
+            environment,
+            command=build_repo_final_capture_script(
+                self._patch_logs_dir_in_env.as_posix()
+            ),
+        )
+
+    @with_prompt_template
+    async def run(
+        self,
+        instruction: str,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        _ = context
+        baseline_captured = False
+        try:
+            config_command = self._build_register_config_command()
+            if config_command:
+                await self.exec_as_agent(
+                    environment,
+                    command=config_command,
+                    env=self._env_for_run(),
+                )
+            await self._capture_repo_baseline(environment)
+            baseline_captured = True
+            await self.exec_as_agent(
+                environment,
+                command=self._build_run_shell(instruction),
+                env=self._env_for_run(),
+            )
+        finally:
+            if baseline_captured:
+                try:
+                    await self._capture_repo_final_state(environment)
+                except Exception as exc:
+                    self.logger.debug(
+                        f"Failed to capture BitFun final repo state: {exc}"
+                    )
+            try:
+                await self.exec_as_agent(
+                    environment,
+                    command=self._cp_back_command(),
+                    env=self._env_for_run(),
+                )
+                self._log_cp_back_gaps()
+            except Exception as exc:
+                self.logger.debug(f"BitFun cp-back failed (non-fatal): {exc}")
+            try:
+                await self._capture_final_app_config(environment)
+            except Exception as exc:
+                self.logger.debug(
+                    f"BitFun final app config capture failed (non-fatal): {exc}"
+                )
