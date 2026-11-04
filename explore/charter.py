@@ -800,6 +800,38 @@ STAGE: ORIENTATION_READY. Publishing begins Actor work; your same context, exact
 observations, and private scratch continue into candidate evaluation."""
 
 
+# Method-only blocks shared with execution adapters. Keep tool/transport details
+# in the role's own charter so adapters do not claim capabilities they lack.
+VERIFIER_INVESTIGATION_AUTHORITY = """\
+You decide the investigation strategy, tools, depth, and when the evidence is
+sufficient."""
+
+VERIFIER_REQUIREMENT_EVIDENCE = """\
+Verification is method-neutral unless the authoritative task makes a method,
+application, native editable state, behavior, workflow, or provenance material. A
+compatible file, backend render, or visually similar export is not by itself proof
+of any such required property.
+
+For every material requirement, use evidence that distinguishes the required result
+from a nearby plausible but incorrect substitute. If the available evidence would
+also approve that substitute, keep investigating through a distinguishing channel."""
+
+VERIFIER_UNVERIFIED_DECISION = """\
+- PASS only when every material requirement is affirmatively supported.
+- FAIL when concrete evidence establishes a material violation.
+- UNVERIFIED when a material claim remains unresolved after investigation, including
+  when credible instruments or observation channels disagree and you cannot yet
+  reconcile why.
+
+UNVERIFIED is neither acceptance nor proof of failure. It returns your complete report
+to the same Actor Agent so the Actor can expose reproducible evidence leads; you remain
+the same persistent Verifier Agent and independently reproduce or falsify those leads.
+Do not use UNVERIFIED when you already have concrete evidence of a violation. Do not
+silently privilege any one instrument, an application report, a proxy artifact, or
+the Actor's probe when credible channels conflict. Investigate the conflict or
+request evidence. Do not solve or repair the task for the Actor Agent."""
+
+
 def agent_harness_verifier_charter(
     task: str,
     report_channel: str,
@@ -878,28 +910,15 @@ Organize and explain the report however you judge best. Publishing commits your 
 and ends this inspection immediately; do not emit a ceremonial second declaration
 afterward."""
     elif allow_unverified:
-        decision_contract = """\
-You decide the investigation strategy, tools, depth, and when the evidence is
-sufficient. There is no prescribed checklist, report schema, probe count, or number
+        decision_contract = f"""\
+{VERIFIER_INVESTIGATION_AUTHORITY} There is no prescribed checklist, report schema, probe count, or number
 of turns. Choose exactly one local verdict:
 
-- PASS only when every material requirement is affirmatively supported.
-- FAIL when concrete evidence establishes a material violation.
-- UNVERIFIED when a material claim remains unresolved after investigation, including
-  when credible instruments or observation channels disagree and you cannot yet
-  reconcile why.
-
-UNVERIFIED is neither acceptance nor proof of failure. It returns your complete report
-to the same Actor Agent so the Actor can expose reproducible evidence leads; you remain
-the same persistent Verifier Agent and independently reproduce or falsify those leads.
-Do not use UNVERIFIED when you already have concrete evidence of a violation. Do not
-silently privilege any one instrument, an application report, a proxy artifact, or
-the Actor's probe when credible channels conflict. Investigate the conflict or
-request evidence. Do not solve or repair the task for the Actor Agent.
+{VERIFIER_UNVERIFIED_DECISION}
 
 When ready, publish your complete lossless report with:
-  {"program":{"lang":"verifier-report","code":"<your complete report>"}}
-This host-side channel is {report_channel}. Include exactly one standalone line outside
+  {{"program":{{"lang":"verifier-report","code":"<your complete report>"}}}}
+This host-side channel is {{report_channel}}. Include exactly one standalone line outside
 quoted examples or code fences: VERDICT: PASS, VERDICT: FAIL, or VERDICT: UNVERIFIED.
 Organize and explain the report however you judge best. Publishing ends this inspection
 immediately; do not emit a ceremonial second declaration afterward."""
@@ -1013,14 +1032,7 @@ channels, not a grade or semantic interpretation:
 
 {actor_privacy_context} You decide what to test and when the evidence is enough.
 
-Verification is method-neutral unless the authoritative task makes a method,
-application, native editable state, behavior, workflow, or provenance material. A
-compatible file, backend render, or visually similar export is not by itself proof
-of any such required property.
-
-For every material requirement, use evidence that distinguishes the required result
-from a nearby plausible but incorrect substitute. If the available evidence would
-also approve that substitute, keep investigating through a distinguishing channel.
+{VERIFIER_REQUIREMENT_EVIDENCE}
 
 {execution_boundary}
 

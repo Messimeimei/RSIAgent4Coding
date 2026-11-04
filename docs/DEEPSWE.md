@@ -1,8 +1,11 @@
 # Native BitFun evaluation on DeepSWE
 
-This integration runs BitFun's own coding loop through Pier's external-agent
+The default native integration runs BitFun's own coding loop through Pier's external-agent
 interface. DeepSWE's pinned tasks, collect hooks and hidden tests are unchanged.
 It does not run RSIAgent's process Verifier, BRS, DRS or memory updates.
+
+For the optional Actor-Verifier mode, see [DEEPSWE_BASELINE.md](DEEPSWE_BASELINE.md).
+Use `--mode baseline` to select it; existing commands keep their native behavior.
 
 ## Pinned runtime
 

@@ -1,4 +1,4 @@
-"""A Pier import-path plugin for Linux BitFun CLI 0.2.15."""
+"""Pier 连接 BitFun CLI 的插件实现，对应 BitFun 0.2.15。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import textwrap
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -15,6 +16,7 @@ from pier.agents.installed.base import NonZeroAgentExitCodeError
 from pier.agents.network import allowlist_from_urls
 from pier.models.agent.network import NetworkAllowlist
 
+# 这里的 _vendor.bitfun_cli 是从 BitFun 官方仓库的 bitfun_cli.py 复制过来的，经过了少量修改以适配 Pier 的环境。
 from ._vendor.bitfun_cli import BitfunCli as UpstreamBitfunCli
 
 _VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -22,7 +24,7 @@ _ROOT = "/tmp/rsiagent-bitfun"
 
 
 def credential_variables(config: dict) -> set[str]:
-    """Keep credentials as references in Pier's persisted job configuration."""
+    """要求配置文件里面的 key 要用 模板变量，否则报错。"""
     names: set[str] = set()
 
     def visit(value):
@@ -69,10 +71,11 @@ class BitfunCli(UpstreamBitfunCli):
         )
 
     def install_spec(self):
-        # The binary is bind-mounted at runtime; no derived agent image is needed.
+        # bitfun 是挂载进容器的，而不是装进镜像，所以这里表示跳过在容器安装 bitfun
         return None
 
     def network_allowlist(self) -> NetworkAllowlist:
+        # 阅读配置获取可以访问网络的端口
         models = self._bitfun_config.get("ai", {}).get("models", [])
         urls = []
         for model in models:
@@ -92,7 +95,7 @@ class BitfunCli(UpstreamBitfunCli):
         return allowlist_from_urls(urls)
 
     def _env_for_run(self) -> dict[str, str]:
-        # Explicit trial roots prevent reading a host user's sessions or memory.
+        # 固定 bitfun 运行路径在 tmp 下，同时检查模型 key 是否设置正确
         result = dict(self._extra_env)
         result.update(
             BITFUN_HOME=f"{_ROOT}/home",
@@ -112,6 +115,7 @@ class BitfunCli(UpstreamBitfunCli):
         return result
 
     async def setup(self, environment) -> None:
+        """检查 bitfun binary 是否存在和版本"""
         result = await environment.exec(
             command=f"test -x {shlex.quote(self._binary_path)} && "
             f"{shlex.quote(self._binary_path)} --version"
@@ -123,54 +127,56 @@ class BitfunCli(UpstreamBitfunCli):
             raise RuntimeError(
                 f"Expected pinned bitfun 0.2.15, found {self._version!r}"
             )
+
         await self.exec_as_agent(
             environment,
             command=f"mkdir -p {shlex.quote(_ROOT)} /logs/agent",
         )
 
     def _build_register_config_command(self) -> str:
-        # This command contains placeholders, never resolved credentials. Pier logs
-        # commands and configuration, so expansion happens only inside the container.
+        # 读取配置里的模型 key 的时候，防止 Pier 把 key 写进日志里；解决代理问题
         payload = json.dumps(self._bitfun_config)
-        script = rf"""import json, os, re
-from pathlib import Path
-from urllib.parse import urlsplit, unquote
-config = json.loads({payload!r})
-pattern = re.compile(r'\$\{{([A-Za-z_][A-Za-z0-9_]*)\}}')
-def expand(value):
-    if isinstance(value, dict):
-        return {{key: expand(item) for key, item in value.items()}}
-    if isinstance(value, list):
-        return [expand(item) for item in value]
-    if isinstance(value, str):
-        match = pattern.fullmatch(value)
-        if match:
-            return os.environ[match.group(1)]
-    return value
-config = expand(config)
-# BitFun 0.2.15 explicitly disables reqwest's system proxy detection.
-# Populate its native proxy config from Pier's authenticated proxy environment.
-proxy_url = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY')
-if proxy_url:
-    proxy = urlsplit(proxy_url)
-    config.setdefault('ai', {{}})['proxy'] = {{
-        'enabled': True,
-        'url': proxy.scheme + '://' + proxy.hostname + ':' + str(proxy.port or 80),
-        'username': unquote(proxy.username or ''),
-        'password': unquote(proxy.password or ''),
-    }}
-path = Path(os.environ['BITFUN_USER_ROOT']) / 'config' / 'app.json'
-path.parent.mkdir(parents=True, exist_ok=True)
-fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, 'w') as stream:
-    json.dump(config, stream)
-os.chmod(path, 0o600)
-"""
-        return "python3 -c " + shlex.quote(script)
+        script = rf"""
+            import json, os, re
+            from pathlib import Path
+            from urllib.parse import urlsplit, unquote
+            config = json.loads({payload!r})
+            pattern = re.compile(r'\$\{{([A-Za-z_][A-Za-z0-9_]*)\}}')
+            def expand(value):
+                if isinstance(value, dict):
+                    return {{key: expand(item) for key, item in value.items()}}
+                if isinstance(value, list):
+                    return [expand(item) for item in value]
+                if isinstance(value, str):
+                    match = pattern.fullmatch(value)
+                    if match:
+                        return os.environ[match.group(1)]
+                return value
+            config = expand(config)
+            # BitFun 0.2.15 explicitly disables reqwest's system proxy detection.
+            # Populate its native proxy config from Pier's authenticated proxy environment.
+            proxy_url = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY')
+            if proxy_url:
+                proxy = urlsplit(proxy_url)
+                config.setdefault('ai', {{}})['proxy'] = {{
+                    'enabled': True,
+                    'url': proxy.scheme + '://' + proxy.hostname + ':' + str(proxy.port or 80),
+                    'username': unquote(proxy.username or ''),
+                    'password': unquote(proxy.password or ''),
+                }}
+            path = Path(os.environ['BITFUN_USER_ROOT']) / 'config' / 'app.json'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(config, stream)
+            os.chmod(path, 0o600)
+            """
+        return "python3 -c " + shlex.quote(textwrap.dedent(script).lstrip())
 
     async def _exec(
         self, environment, command, user=None, env=None, cwd=None, timeout_sec=None
     ):
+        """通用执行任务函数"""
         process_env = environment.agent_process_env(env or self._env_for_run())
         result = await environment.exec(
             command="set -o pipefail; " + command,
@@ -187,10 +193,10 @@ os.chmod(path, 0o600)
         return result
 
     def _build_run_shell(self, instruction: str) -> str:
+        # 构建 bitfun 运行命令，解决指定的题目
         command = super()._build_run_shell(instruction)
         command = command.replace(" exec --agent ", " exec --auto --agent ", 1)
-        # docker exec cancellation alone does not kill the process inside Docker.
-        # Record a process-group ID so timeout cleanup can stop the whole CLI tree.
+
         return (
             f"setsid bash -c {shlex.quote(command)} &\n"
             "bitfun_pid=$!\n"
@@ -202,35 +208,39 @@ os.chmod(path, 0o600)
         )
 
     def _cp_back_command(self) -> str:
-        script = r"""import json, os, shutil
-from pathlib import Path
-home = Path(os.environ['BITFUN_HOME'])
-user = Path(os.environ['BITFUN_USER_ROOT'])
-dest = Path('/logs/agent/bitfun')
-dest.mkdir(parents=True, exist_ok=True)
-manifest = {}
-for kind in ('sessions', 'request-traces'):
-    sources = sorted((home / 'projects').glob('*/' + kind))
-    manifest[kind] = [str(source) for source in sources]
-    for source in sources:
-        shutil.copytree(source, dest / kind, dirs_exist_ok=True)
-for relative, target in (
-    ('data/token_usage', 'token_usage'), ('cli-logs', 'cli-logs'),
-    ('logs/bitfun-cli.log', 'cli.log'),
-    ('logs/ai-request-audit.jsonl', 'ai-request-audit.jsonl'),
-):
-    source = user / relative
-    manifest[target] = {'source': str(source), 'exists': source.exists()}
-    if source.is_dir():
-        shutil.copytree(source, dest / target, dirs_exist_ok=True)
-    elif source.is_file():
-        shutil.copy2(source, dest / target)
-(dest / 'cp-back-manifest.json').write_text(json.dumps(manifest, indent=2))
-"""
-        return "python3 -c " + shlex.quote(script)
+        # 记录容器里面的信息，如对话记录，token 情况，运行日志等
+        script = r"""
+            import json, os, shutil
+            from pathlib import Path
+            home = Path(os.environ['BITFUN_HOME'])
+            user = Path(os.environ['BITFUN_USER_ROOT'])
+            dest = Path('/logs/agent/bitfun')
+            dest.mkdir(parents=True, exist_ok=True)
+            manifest = {}
+            for kind in ('sessions', 'request-traces'):
+                sources = sorted((home / 'projects').glob('*/' + kind))
+                manifest[kind] = [str(source) for source in sources]
+                for source in sources:
+                    shutil.copytree(source, dest / kind, dirs_exist_ok=True)
+            for relative, target in (
+                ('data/token_usage', 'token_usage'), ('cli-logs', 'cli-logs'),
+                ('logs/bitfun-cli.log', 'cli.log'),
+                ('logs/ai-request-audit.jsonl', 'ai-request-audit.jsonl'),
+            ):
+                source = user / relative
+                manifest[target] = {'source': str(source), 'exists': source.exists()}
+                if source.is_dir():
+                    shutil.copytree(source, dest / target, dirs_exist_ok=True)
+                elif source.is_file():
+                    shutil.copy2(source, dest / target)
+            (dest / 'cp-back-manifest.json').write_text(json.dumps(manifest, indent=2))
+            """
+        return "python3 -c " + shlex.quote(textwrap.dedent(script).lstrip())
 
     async def run(self, instruction, environment, context) -> None:
         baseline_captured = False
+
+        # 分别执行注册模型配置、捕获快照信息以及运行解决题目的 bitfun 命令
         try:
             await self.exec_as_agent(environment, self._build_register_config_command())
             await self._capture_repo_baseline(environment)
@@ -255,6 +265,8 @@ for relative, target in (
                     "BitFun process cleanup failed; Pier must remove the container"
                 )
             raise
+
+        # 完成后，再次捕获快照信息，用于构造 patch 补丁交给官方测试
         finally:
             if baseline_captured:
                 try:

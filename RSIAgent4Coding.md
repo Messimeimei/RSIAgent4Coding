@@ -77,37 +77,7 @@ retry:
 
 表示每个任务只尝试一次。
 
-## 四、RSIAgent 对不同任务的适配兼容
-
-0. **原生 Actor 和 Verifier 的循环**
-
-RSIAgent 对 OSWorld 和 ALE 任务用的 Actor 和 Verifier 都是通过固定自带的 system prompt，发送给模型后，要求模型必须返回 program/look/done 的 JSON 文本，由对应代码解析后
-交给 VM 执行。再由 Verifier 检查执行结果。两者只是具体的 VM 环境和执行内容不同，因此可以复用一套逻辑。
-
-1. **对 bitfun 的评测兼容**
-
-DeepSWE 因为要使用 bitfun cli 进行评测，而 bitfun 本身有自己的完整的 coding prompt，它自己决定如何读代码，编辑等，以及要返回什么内容，如果复用原来的 Actor 内容，那评测的就
-变成 RSIAgent 自己写的 actor 逻辑，而非 bitfun。所以必须把 Actor 给替换掉，将其抽象成一个输入输出器，具体到 DeepSWE 这个任务就是：
-
-ActorInput：
-    - 任务描述
-    - 环境
-    - 之前的 verifier 反馈
-  
-ActorOutput：
-    - model_patch
-    - 其他
-  
-并且 Actor 的要求其实基本可以复用之前 bitfun 正常评测用的逻辑，包括输入输出（待确定），只有 Verifier 需要复现 RSIAgent 逻辑，则需要把论文里面的要求重新定义给 bitfun，例如返回
-的状态 PASS，FAIL 和 UNVERIFIED 等。
-
-2. Verifier 适配
-
-Verifier 之前会通过 verifier_execution_mode: rollback_mirror 回滚得方式，保护 Actor 的候选结果，对于 Actor 产物是代码补丁这种任务需要专门适配。
-
-## 五、RSIAgent baseline 适配 Coding 任务
-
-### 1. 支持 Bitfun agent 测评
+## 四、RSIAgent baseline 适配 Coding 任务
 
 第一个需要考虑的适配问题是被评测对象 bitfun 的适配，deepswe 的官方流程如下：
 
@@ -121,8 +91,9 @@ Verifier 之前会通过 verifier_execution_mode: rollback_mirror 回滚得方�
 
 通过 Pier 来管理整个评测过程，被评测的 agent 是 mini-swe-agent，然后再调用模型即可。整个 RSIAgent 适配 Coding 任务也可以从上面的官方流程来入手修改：
 
-- 第一步：将 DeepSWE 的评测，修改成可以支持对 bitfun 的评测，这里面需要修改的应该是 Pier 相关的。但是不管怎么样，这一步要实现的就是让 bitfun 可以完成对 DeepSWE 的评测。
-修改内容如下：
+### 第一步：将 DeepSWE 的评测，修改成可以支持对 bitfun 的评测
+
+这里面需要修改的应该是 Pier 相关的。但是不管怎么样，这一步要实现的就是让 bitfun 可以完成对 DeepSWE 的评测。修改内容如下：
 
 | 文件 | 作用 |
 |---|---|
@@ -143,12 +114,59 @@ Verifier 之前会通过 verifier_execution_mode: rollback_mirror 回滚得方�
 
 其中，run_deepswe.py 主要负责各种配置，路径解析，和运行前的各种检查，最后调用 Pier 启动评测。benchmark/deepswe 下面的两个 python 文件负责适配工作，包括 Pier 适配评测 bitfun 和容器环境的适配，例如支持特殊模型端口的访问，维持独立的评分容器隔离等都是在容器环境适配这里完成。_vendor 下的四个文件主要是复用上游的 bitfun 能力。config/deepswe 下面则是每个实验的配置，可以选择一个通用的，也可以单独为每个任务配置一个 YAML 文件，同时里面的 versions.json 声明了依赖的版本信息，如 bitfun，Pier 和 deepswe 等的版本。对应用的数据集、agent 和 评测框架的版本信息。scripts/setup_deepswe.sh 则是把上面的版本声明落实为可执行环境，包括建立独立的虚拟环境，安装 Pier、bitfun 等。剩下的就是测试文件和 docs 说明文档。
 
-- 第二步：完成 RSIAgent 的 baseline 对第一步的兼容。在第一步的基础上，把 RSIAgent 的 Actor - Verifier 的 baseline 逻辑接入进去。在这一步就需要把之前的 Actor 的逻辑进一步给抽象成，让 bitfun 充当 Actor 的角色，把之前通过发送历史对话轮调用 Actor 的方式，改成直接把命令发给 bitfun，并且由 bitfun 长程完成该任务，不再需要循环叠加传入历史对话。Verifier 也是一样。RSIAgent 本身只负责整个流程的管理，如会话连续性，终止条件等待。
+在这一步完成后，可以通过 .runtime/deepswe/venv/bin/python run_deepswe.py run 加入指定的执行参数如 --taks --name 等，实现对 bitfun agent 的评测。
 
-- 第三步：在第二步的基础上引入 RSIAgent 的概念，这一步需要考虑的是怎么把 Curriculum 的概念引入，这个需要一个单独的 bitfun 会话负责完整，并生成对应的训练材料；然后需要修改之前 Actor 做题的逻辑，也是单独开一个 bitfun 会话，在会话里面完成连续的作答并最后给出交付的材料。这里需要修改的就是 Actor 相关的 prompt，把之前适配桌面操作相关的修改掉，包括允许模型做的操作，和返回格式的要求等，都需要重新修改。最后是 Verifier 的 prompt 也需要修改，包括指定返回的判断类型，需要告诉 bitfun 返回 PASS 还是 FAIL 还是 UNVERIFIER，除此之外，Verifier 的回滚问题也需要适配，在 Verifier 进行检查之前需要保存 Actor 的结果，同时 Verifier 与 Actor 之间的返工交互也要做好，如果 Verifier 觉得需要继续做的话，怎么把 Verifier 的结果给到 Actor 再让 Actor 接着干活。
-  
+### 第二步：完成 RSIAgent 的 baseline 对第一步的兼容。
+
+在第一步的基础上，把 RSIAgent 的 Actor - Verifier 的 baseline 逻辑接入进去。在这一步就需要把之前的 Actor 的逻辑进一步给抽象成，让 bitfun 充当 Actor 的角色，把之前通过发送历史对话轮调用 Actor 的方式，改成直接把命令发给 bitfun，并且由 bitfun 长程完成该任务，不再需要循环叠加传入历史对话。Verifier 也是一样。RSIAgent 本身只负责整个流程的管理，如会话连续性，终止条件等待。
+
+具体来说，需要考虑的适配问题就是两点：控制层面的谁干活、谁判断、怎么反馈、恢复等这些和任务无关的逻辑和具体的模型调用，工作环境等完全任务相关。所以 DeepSWE 的代码任务可以直接用 RSIAgent 的工作逻辑；但是具体的模型调用，工作环境就需要修改，包括 bitfun 本身是 agent，有自己的循环，会话和 system prompt 等；和之前要求虚拟机的工作环境等，现在不需要了。
+
+- **首先第一个是适配 bitfun** 即原来的模型 API 调用，发送历史对话消息的方式，怎么转换成调用 bitfun；以及原来的角色 prompt 是直接第一轮发送给远端 API 模型，现在要怎么发送给 bitfun，因为 bitfun 有自己的 system prompt；还有最后一个问题就是 prompt 本身的内容，怎么适配到 DeepSWE 任务上面，原来的 prompt 里面的方法层面的 prompt 可以保存，但是还有一些涉及到具体任务的需要做适配修改。
+
+简单来说，当前 bitfun 充当 actor 的方式，就是把专门的一个 actor_prompt 传入到 bitfun 的 user message 当中，注意不是 system prompt，因为当前 bitfun 运行开始的时候，会先注入自己的 system prompt，再插入 tool calling guide 等多条提醒，actor_prompt 是通过用户消息传递给 bitfun。而之前的通过叠加历史对话来实现在同一个上下文的方式，在 bitfun 可以通过 resume 来实现同一个会话。
+
+而 prompt 本身的修改，
+
+- **然后第二个是适配 DeepSWE 任务的执行流程** 之前 OSWorld-V2 是在虚拟机的环境下，通过从宿主机接受模型 API 以 JSON 格式返回的 program/look/done 等命令，然后在虚拟机里面执行这些命令，并把结果返回给模型 API，最后 Actor 提交的材料是压缩包形式的修改后的材料，由 Verifier 进行读取和验证。最后的官方打分也是检查虚拟机里面的材料，并按照程序进行分权打分。
+
+而 DeepSWE 任务是在 Docker 环境下，指定容器内有开源仓库的 base commit，然后 bitfun 需要修改仓库里面的文件，最后返回一个 patch 文件，再由官方评分器进行打分完成 f2p 和 p2p 的评测。具体的流程区别如下：
+
+1. osworld 是启动 QUMW 的虚拟机，而 Pier 是启起 docker 容器，且里面已经有 HEAD == base commit，表示干净的环境
+
+2. Actor 干活区别。osworld 是由 actor 每轮输出 JSON 动作，宿主机塞进虚拟机，执行完把 stdout/exit code 给到模型；deepsew 是把 instruction.md 给到提前编写好的 actor_prompts 里的 TASK 模板变量之中，然后整个 actor_prompts 给到 bifun exec 命令的输入里面后续由 bitfun 在容器里面跑完完整流程，包括读写操作等。而原来的 RSIAgent 需要负责保存 history，调用模型，解析 program/look/done 操作和执行结果并返回模型。（run_osworld.py 启动整个流程：benchmarks.osworld.task.py 启动环境，然后需要调用 llm/client.py，以及 core/loop.py 里面的逻辑实现）
+
+3. Actor 独立检查，并提交完成材料的区别。原始的 osworld 和 deepswe 两者的提交产物，都是留在工作环境中，不会上传任何东西，提交的只是一个 JSON 内容告知完成了。osworld 的产物就是放在虚拟机里面的被修改好的文件和应用的状态，如 excle 表被修改好了；deepswe 的产物就是 docker 容器里面 /app 的仓库里面已经 commit 的代码改动。例如代码编辑后，执行了 git commit，那么改动就留在了 git 历史里面，通过执行 git diff 就可以把 patch 导出用于评测。
+
+原本 osworld 任务，模型在 actor 完成任务后进入 verifier 之前，会要求先检查一遍，这里的检查的内容就是 actor 返回的 JSON 格式的 done 里面的 checks 字段。相对应的， bitfun 是调用它自己的工具写入 json 文件来表示结束和提交，字段如下：
+
+{
+  "kind": "actor_done",
+  "candidate_head": "a3f8c2e...",        ← 我提交的 git commit 号
+  "summary": "我实现了 RFC 5545 时区互操作...",
+  "checks": [
+    {
+      "desc": "repr 必须可重建 rrule 对象",
+      "probe": "cd /app && python -m pytest tests/test_rrule.py -k testRruleReprReconstructable && printf 'PASS'"
+    }
+  ]
+}
+
+checks 字段里面的 probe 就是需要进行自检查的内容，这个是进入 verifier 之前的一次门槛，通过了才会进入 verifier，没通过则直接把失败的信息反馈给 actor 不走 verifier。当前的两个实现，都会先完成自检查，osworld 的自检查是直接在 actor 所在的虚拟机里面执行相关命令，没通过的话 actor 可以直接返工；而 deepswe 则是重新开一个容器，检查完后销毁。
+
+4. Verifier 检查的区别。osworld 的 verifier 需要检查的是一个正在运行的虚拟机（上面有 actor 在运行提交了结果），所以为了防止后续 verifier 破坏 actor 的提交产物，采用的是 rollback_mirror，会事先保存 checkpoint，完成检查的操作后会进行回滚。这里是在一个隔离的环境。而 deepswe 没有这种顾虑，它完全可以在一个新的容器上（目前就一共有3个独立的 容器了，分别是 actor，verifier 和这个用于检查的）创造一个新的一样的 base commit 仓库，应用 actor 提交的 patch 来进行检查。用完了再删除该容易。
+
+两者检查的过程因为任务的不同而不同，一个检查虚拟机里面的文件，通过截图看内容等，另一个看 patch 是否有用等。但最后都返回一个 verdict 报告，里面有 PASS/FAIL/UNVERIFIED, report, findings, evidence, evidence_requests 这些字段，如果时 FAIL 会把 report 报告返回给同一个 actor 会话，补齐后再在相同的 verifier 里面检查，如此循环。
+
+5. 官方打分的区别。osworld 最后完成了的产物，是保存在虚拟机里面的，它有一个官方的 grader 会去查看虚拟机里面的状态，例如对应任务的材料 excel 表的状态，然后按照不同的权重进行打分返回 0-100 的分数。而 deepswe 是由 Pier 的 collect 收集 docker 容器里面的材料，主要是容器里面已经提交的 diff，即 patch 文件。然后在官方的隐藏镜像环境里面，用程序进行评测得到分数。
+
+> 上述逻辑已经同步实现，与基础的 baseline 尚不一致的地方包括：
+> 1. 当前 bitfun 会提前进行上下文压缩，导致 verifier 可能丢失细节，任务越长影响越大。
+> 2. actor 自检查环节。actor 给出的待检查的 probe，会被分为三类，accepted	rejections	dropped。前者是通过命令检查的，第二个是没通过命令检查的。
+> 3. 独立的 witness gate 没有实现。原始逻辑会检查 Actor 的 probes 是否至少有一个独立渠道证据，如果所有 probe 都只是重新读取自己产生的文件，系统会一次性要求 Actor 增加独立 witness。
+
+### 第三步：在第二步的基础上引入 RSIAgent 的概念。
+
+这一步需要考虑的是怎么把 Curriculum 的概念引入，这个需要一个单独的 bitfun 会话负责完整，并生成对应的训练材料；然后需要修改之前 Actor 做题的逻辑，也是单独开一个 bitfun 会话，在会话里面完成连续的作答并最后给出交付的材料。这里需要修改的就是 Actor 相关的 prompt，把之前适配桌面操作相关的修改掉，包括允许模型做的操作，和返回格式的要求等，都需要重新修改。最后是 Verifier 的 prompt 也需要修改，包括指定返回的判断类型，需要告诉 bitfun 返回 PASS 还是 FAIL 还是 UNVERIFIER，除此之外，Verifier 的回滚问题也需要适配，在 Verifier 进行检查之前需要保存 Actor 的结果，同时 Verifier 与 Actor 之间的返工交互也要做好，如果 Verifier 觉得需要继续做的话，怎么把 Verifier 的结果给到 Actor 再让 Actor 接着干活。
+
 - 第四步：还有需要考虑的就是，最后得到了冻结的记忆，应该怎么保存和加载。包括 BRS 和 DRS 两个阶段得到的记忆怎么保存，最后怎么在 phase2 开头和最后的 phase3 阶段加载给 bitfun 让他读取记忆完成任务。
-
-### 2. 支持 DeepSWE 任务专属测评
-
-这一步对应的是前面说的修改 Curriculum、Actor 和 Verifier 等角色的 prompt 语义，使得 RSIAgent 可以支持 DeepSWE 任务的评测。

@@ -403,7 +403,7 @@ def _execute_branch(
         control_cfg = _branch_control_config(verifier_control_cfg)
         session = VerifierSession()
         try:
-            verdict, findings = verify_agentic(
+            verdict, findings = (hooks.verify_agentic or verify_agentic)(
                 project.instruction, vm, control_cfg,
                 sink=ArtifactSink(str(episode_dir / "verifier/cycle_001")),
                 turn_no=project_index,

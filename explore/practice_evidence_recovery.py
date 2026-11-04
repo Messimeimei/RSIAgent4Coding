@@ -153,11 +153,11 @@ def run_practice_with_evidence(*, hooks, vm, lineage, episode_dir, project_index
             before_turns = len(list(verifier_root.glob('verifier_agent/inspection_*/segment_*/iter_*/turn.txt')))
             remaining_wall = verifier_wall_cap - verifier_wall - (time.monotonic() - started)
             require(remaining_wall > 0, 'Verifier setup exhausted remaining budget')
-            verdict, report = verify_agentic(
+            verdict, report = (hooks.verify_agentic or verify_agentic)(
                 project, vm, control, sink=ArtifactSink(str(verifier_root)),
                 turn_no=project_index, context=context, session=session,
                 wall_budget=remaining_wall, iters_budget=verifier_role.max_iters-verifier_used,
-                actor_evidence_leads=actor_leads(history, project, actor_cfg) if evidence_requested else '')
+                actor_evidence_leads=(hooks.actor_evidence_leads or actor_leads)(history, project, actor_cfg) if evidence_requested else '')
             verifier_wall += time.monotonic() - started
             verifier_used += max(1, len(list(verifier_root.glob(
                 'verifier_agent/inspection_*/segment_*/iter_*/turn.txt'))) - before_turns)

@@ -1039,6 +1039,9 @@ class PracticeHooks:
     audit_text: Callable[..., list[Any]] = audit_text
     audit_transcripts: Callable[..., list[Any]] = audit_transcripts
     push_dir: Callable[..., bool] = memory_transport.push_dir
+    # Optional execution adapters. None preserves the released OSWorld runtime.
+    verify_agentic: Callable[..., Any] | None = None
+    actor_evidence_leads: Callable[..., str] | None = None
 
 
 def _resume_completed_phase1_boundary(

@@ -441,7 +441,7 @@ def _run_practice_attempt(
             "execution logs are hidden by the harness."
         )
         try:
-            verdict, findings = verify_agentic(
+            verdict, findings = (hooks.verify_agentic or verify_agentic)(
                 project,
                 vm,
                 control_cfg,

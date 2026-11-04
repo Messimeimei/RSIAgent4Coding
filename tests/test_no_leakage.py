@@ -47,13 +47,13 @@ def test_prompts_contain_no_task_tokens():
         assert not hits, f"task-derived tokens in {surface}: {hits}"
 
     charter = open(os.path.join(ROOT, "explore", "charter.py")).read().lower()
-    agentic = charter.split("def agent_harness_verifier_charter(", 1)[1].split(
+    agentic = charter.split("verifier_investigation_authority =", 1)[1].split(
         "def self_evolving_target_verifier_charter(", 1)[0]
     hits = [t for t in blocklist if re.search(r"\b" + re.escape(t) + r"\b", agentic)]
     assert not hits, f"task-derived tokens in agentic verifier charter: {hits}"
 
     runtime = open(os.path.join(ROOT, "core", "verifier_runtime.py")).read().lower()
-    runtime_prompts = runtime.split("agentic_verifier_system =", 1)[1].split(
+    runtime_prompts = runtime.split("agentic_verifier_evidence =", 1)[1].split(
         "@dataclass", 1)[0]
     hits = [t for t in blocklist
             if re.search(r"\b" + re.escape(t) + r"\b", runtime_prompts)]

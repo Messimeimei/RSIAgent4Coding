@@ -73,7 +73,7 @@ The configured user response arrives on your next turn and remains in your compl
 conversation history. Investigate the environment first; ask only for information or \
 inputs that cannot be recovered from it."""
 
-_SYSTEM_TEMPLATE = """\
+_SYSTEM_OPENING = """\
 You solve ONE task on a real Ubuntu machine by WRITING PROGRAMS. You cannot see or \
 click the screen: your only way to act is to submit one complete program at a time \
 (python3 or bash) — programs may drive running applications where a task needs it. \
@@ -82,8 +82,10 @@ Work like an engineer at a REPL: investigate first, then commit a solution, then
 verify it.
 
 EPISTEMIC CORE — how truth is established here (applies to everything below):
-{core}
+{core}"""
 
+# Shared method text; environment adapters may change mechanics, not doctrine.
+ACTOR_METHOD = """\
 THE METHOD — code as policy:
 1. RECON FIRST, EXHAUSTIVELY. Map the parts of the machine the task involves before \
 acting. Enumerate rather than assume: search broadly (the whole home directory, \
@@ -156,8 +158,9 @@ or numbers, element positions, coordinates, counts, document structure — is \
 EXTRACTED or EDITED with a program; tasks are graded by computing those same exact \
 values, so an approximate visual answer cannot pass where a precise coded one will. \
 Use `look` for RECOGNITION and for judging RENDERED results — identifying WHAT \
-something is, or whether something looks right when displayed.
+something is, or whether something looks right when displayed."""
 
+_SYSTEM_ACTIONS = """\
 REPLY FORMAT — exactly ONE JSON object per turn (reasoning before it is fine; the \
 object comes last):
   {{"program": {{"lang": "python", "code": "<one complete program>"}}}}        // or "bash"
@@ -178,6 +181,8 @@ code is appended as "[exit N]"; N=124 \
 means it hit the time limit — split the work into smaller programs. A line like \
 "[channel error: ...]" or "[command timed out ...]" means the machine did not \
 answer — it is NOT command output (core E4)."""
+
+_SYSTEM_TEMPLATE = _SYSTEM_OPENING + "\n\n" + ACTOR_METHOD + "\n\n" + _SYSTEM_ACTIONS
 
 
 def build_system(cfg=None, *, ask_enabled: bool = False) -> str:

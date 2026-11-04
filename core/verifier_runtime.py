@@ -24,6 +24,24 @@ import tempfile
 import time
 from dataclasses import dataclass
 
+# Method-level text shared with other execution interfaces.
+AGENTIC_VERIFIER_EVIDENCE = """\
+Treat observations as evidence, not proof by assertion. Derive every binding
+requirement from the authoritative task and falsify nearby plausible substitutes."""
+
+AGENTIC_VERIFIER_BINARY_VERDICT = """\
+PASS only when every material requirement is affirmatively supported. If a material
+requirement is violated or remains unsupported after investigation, publish FAIL
+with the concrete evidence. Causal learning and repair remain the Actor Agent's role."""
+
+AGENTIC_VERIFIER_UNVERIFIED_VERDICT = """\
+PASS only when every material requirement is affirmatively supported. Publish FAIL
+when concrete evidence establishes a material violation. Publish UNVERIFIED when a
+material claim remains unresolved after investigation or credible instruments disagree.
+UNVERIFIED requests reproducible evidence from the same Actor Agent; it is neither
+acceptance nor proof of failure. Reconcile conflicting channels before PASS rather than
+silently privileging one instrument. Causal learning and repair remain the Actor's role."""
+
 AGENTIC_VERIFIER_SYSTEM = """\
 You are an independent Verifier Agent inspecting one completed candidate on a real
 Ubuntu machine. You decide how to investigate, what programs and tools to use, how
@@ -52,12 +70,7 @@ to VERIFIER_SCRATCH before using a tool that expects to write beside its input. 
 normal Look may inspect files you generated in VERIFIER_SCRATCH. These mechanics
 protect the scored state without prescribing your method.
 
-Treat observations as evidence, not proof by assertion. Derive every binding
-requirement from the authoritative task and falsify nearby plausible substitutes.
-PASS only when every material requirement is affirmatively supported. If a material
-requirement is violated or remains unsupported after investigation, publish FAIL
-with the concrete evidence. Causal learning and repair remain the Actor Agent's role.
-"""
+""" + AGENTIC_VERIFIER_EVIDENCE + "\n" + AGENTIC_VERIFIER_BINARY_VERDICT + "\n"
 
 AGENTIC_VERIFIER_NUDGE = (
     'Your reply contained no valid Verifier action. Reply with exactly one plain '
@@ -127,15 +140,8 @@ def agentic_verifier_system_for(
             "The report must contain exactly one standalone VERDICT: PASS, "
             "VERDICT: FAIL, or VERDICT: UNVERIFIED line.",
         ).replace(
-            "PASS only when every material requirement is affirmatively supported. If a material\n"
-            "requirement is violated or remains unsupported after investigation, publish FAIL\n"
-            "with the concrete evidence. Causal learning and repair remain the Actor Agent's role.",
-            "PASS only when every material requirement is affirmatively supported. Publish FAIL\n"
-            "when concrete evidence establishes a material violation. Publish UNVERIFIED when a\n"
-            "material claim remains unresolved after investigation or credible instruments disagree.\n"
-            "UNVERIFIED requests reproducible evidence from the same Actor Agent; it is neither\n"
-            "acceptance nor proof of failure. Reconcile conflicting channels before PASS rather than\n"
-            "silently privileging one instrument. Causal learning and repair remain the Actor's role.",
+            AGENTIC_VERIFIER_BINARY_VERDICT,
+            AGENTIC_VERIFIER_UNVERIFIED_VERDICT,
         )
     if mode == ROLLBACK_MIRROR:
         base = base.replace(
@@ -150,9 +156,7 @@ AGENTIC_VERIFIER_ROUTE_SYSTEM = AGENTIC_VERIFIER_SYSTEM.replace(
     "The report must contain exactly one standalone ROUTE: HANDOFF, ROUTE: REVISE, "
     "or ROUTE: EVOLVE line.",
 ).replace(
-    "PASS only when every material requirement is affirmatively supported. If a material\n"
-    "requirement is violated or remains unsupported after investigation, publish FAIL\n"
-    "with the concrete evidence. Causal learning and repair remain the Actor Agent's role.",
+    AGENTIC_VERIFIER_BINARY_VERDICT,
     "HANDOFF only when every material requirement is affirmatively supported. Otherwise,\n"
     "publish REVISE or EVOLVE as defined in the authoritative project charter, with the\n"
     "concrete evidence. Causal learning and repair remain the Actor Agent's role.",
@@ -189,11 +193,7 @@ AGENTIC_VERIFIER_ORIENTATION_SYSTEM = AGENTIC_VERIFIER_SYSTEM.replace(
     "The private report must contain exactly one standalone "
     "STAGE: ORIENTATION_READY line.",
 ).replace(
-    "Treat observations as evidence, not proof by assertion. Derive every binding\n"
-    "requirement from the authoritative task and falsify nearby plausible substitutes.\n"
-    "PASS only when every material requirement is affirmatively supported. If a material\n"
-    "requirement is violated or remains unsupported after investigation, publish FAIL\n"
-    "with the concrete evidence. Causal learning and repair remain the Actor Agent's role.",
+    AGENTIC_VERIFIER_EVIDENCE + "\n" + AGENTIC_VERIFIER_BINARY_VERDICT,
     "No candidate exists in this stage. Freely learn the authoritative environment,\n"
     "preserve evidence, and use or author any private instruments you judge useful.\n"
     "An executable evaluator is optional. Do not grade, route, or repair anything.",
