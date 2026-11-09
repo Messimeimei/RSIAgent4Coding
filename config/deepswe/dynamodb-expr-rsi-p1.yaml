@@ -1,0 +1,96 @@
+# Same RSI settings as dateutil; task and practice concurrency are both 1.
+jobs_dir: results/deepswe/jobs
+job_name: bitfun-dynamodb-expr-rsi-20261106-p1-01
+n_attempts: 1
+n_concurrent_trials: 1
+timeout_multiplier: 1
+agent_timeout_multiplier: 1
+verifier_timeout_multiplier: 1
+environment_build_timeout_multiplier: 1
+retry:
+  max_retries: 0
+environment:
+  type: docker
+  import_path: benchmarks.deepswe.docker_environment:BitfunDockerEnvironment
+  kwargs:
+    inference_ports:
+    - 8080
+  force_build: false
+  delete: true
+  cpu_enforcement_policy: limit
+  memory_enforcement_policy: limit
+  mounts:
+  - type: bind
+    source: .runtime/deepswe/bin/uv
+    target: /usr/local/bin/uv
+    read_only: true
+    bind:
+      create_host_path: false
+  - type: bind
+    source: .runtime/deepswe/bin/bitfun
+    target: /usr/local/bin/bitfun
+    read_only: true
+    bind:
+      create_host_path: false
+agents:
+- name: bitfun-rsi
+  import_path: benchmarks.deepswe.rsi:BitfunRSI
+  model_name: DeepSeek-V4.1-Flash-1017
+  kwargs:
+    binary_path: /usr/local/bin/bitfun
+    output_patch_path: null
+    total_timeout_sec: 10200
+    learning_timeout_sec: 86400
+    target_learning_timeout_sec: 36000
+    brs_project_budget: 8
+    parallel: 1
+    report_recovery_attempts: 2
+    checkpoint_repair_timeout_sec: 3600
+    command_timeout_sec: 600
+    stall_recovery: true
+    allow_role_swap: true
+    bitfun_config:
+      app: &id001
+        logging:
+          model_exchange_tracing:
+            mode: full
+      ai:
+        models:
+        - id: DeepSeek-V4.1-Flash-1017
+          name: DeepSeek-V4.1-Flash-1017
+          provider: openai
+          model_name: DeepSeek-V4.1-Flash-1017
+          base_url: http://113.46.219.251:8080/v1
+          api_key: ${API_KEY}
+          enabled: true
+          context_window: 1048576
+          max_tokens: 65536
+          reasoning_mode: enabled
+          reasoning_effort: max
+        default_models:
+          primary: DeepSeek-V4.1-Flash-1017
+          fast: DeepSeek-V4.1-Flash-1017
+    verifier_bitfun_config: &id002
+      app: *id001
+      ai:
+        models:
+        - id: Qwen3.8-Flash
+          name: Qwen3.8-Flash
+          provider: openai
+          model_name: Qwen3.8-Flash
+          base_url: http://113.46.219.251:8080/v1
+          api_key: ${API_KEY}
+          enabled: true
+          context_window: 1048576
+          max_tokens: 65536
+          reasoning_mode: enabled
+          reasoning_effort: max
+        default_models:
+          primary: Qwen3.8-Flash
+          fast: Qwen3.8-Flash
+    curriculum_bitfun_config: *id002
+datasets:
+- path: ../DeepSWE/tasks
+  task_names:
+  - dynamodb-toolbox-lazy-recursive-schemas
+  - expr-try-catch-errors

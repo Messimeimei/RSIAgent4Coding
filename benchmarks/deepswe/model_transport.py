@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -25,6 +26,58 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 def recoverable_status(status):
     # Same status policy as llm.client._recoverable_transport.
     return status in {401, 402, 403, 408, 409, 425, 429} or 500 <= status <= 599
+
+
+_MAX_TOKENS_LIMIT = re.compile(
+    r"max_tokens.*?(?:valid|maximum|limit).*?(?:<=|less than or equal to)\s*(\d+)"
+    r".*?(?:got|received)\s*(\d+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def max_tokens_limit(body):
+    """Return an explicit provider output-token limit, if the error states one.
+
+    This intentionally recognizes only the unambiguous "max_tokens ... <= N ...
+    got M" form.  A generic 400 response must remain fatal rather than becoming
+    an unbounded or speculative request rewrite.
+    """
+    if not body:
+        return None
+    if isinstance(body, bytes):
+        body = body[:131072].decode("utf-8", "replace")
+    match = _MAX_TOKENS_LIMIT.search(str(body))
+    if not match:
+        return None
+    limit, requested = map(int, match.groups())
+    return limit if requested > limit > 0 else None
+
+
+def _request_with_max_tokens(request, limit):
+    """Clone an OpenAI request with one provider-confirmed smaller cap."""
+    if not limit or limit <= 0:
+        return None
+    try:
+        payload = json.loads(request.data or b"{}")
+        if not isinstance(payload, dict):
+            return None
+        requested = int(payload.get("max_tokens"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if requested <= limit:
+        return None
+    payload["max_tokens"] = limit
+    headers = dict(request.headers)
+    headers.pop("Content-Length", None)
+    headers.pop("content-length", None)
+    return Request(
+        request.full_url,
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers=headers,
+        origin_req_host=request.origin_req_host,
+        unverifiable=request.unverifiable,
+        method=request.get_method(),
+    )
 
 
 def response_error(data, content_type):
@@ -53,7 +106,8 @@ def response_error(data, content_type):
                     or value.get("type") == "response.completed"
                     or any(
                         c.get("finish_reason") is not None
-                        for c in value.get("choices", [])
+                        for c in (value["choices"] if isinstance(value.get("choices"), list) else [])
+                        if isinstance(c, dict)
                     )
                 ):
                     completed = True
@@ -68,7 +122,7 @@ def response_error(data, content_type):
             return None
         for value in records:
             if not isinstance(value, dict):
-                continue
+                return 503
             error = value.get("error")
             if error:
                 try:
@@ -76,7 +130,8 @@ def response_error(data, content_type):
                 except (TypeError, ValueError):
                     code = 503
                 return code if 400 <= code <= 599 else 503
-            if "choices" in value and not value["choices"]:
+            if "choices" in value and (not isinstance(value["choices"], list)
+                    or not value["choices"] or any(not isinstance(c, dict) for c in value["choices"])):
                 return 503
         return None
     finally:
@@ -110,6 +165,7 @@ class ModelRelay(ThreadingHTTPServer):
     def fetch(self, request_id, request, cancelled):
         batch_started = time.monotonic()
         attempt = 0
+        max_tokens_adapted = False
         while not cancelled.is_set():
             data = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
             try:
@@ -152,12 +208,36 @@ class ModelRelay(ThreadingHTTPServer):
                     response.close()
                 data.seek(0)
                 failure = response_error(data, content_type)
+                if failure == 400 and not max_tokens_adapted:
+                    body = data.read()
+                    replacement = _request_with_max_tokens(
+                        request, max_tokens_limit(body)
+                    )
+                    data.seek(0)
+                    if replacement is not None:
+                        data.close()
+                        request = replacement
+                        max_tokens_adapted = True
+                        self.record(request_id, "max_tokens_adapted", limit=max_tokens_limit(body))
+                        continue
                 if failure is None or not recoverable_status(failure):
                     return failure or 200, content_type, data
             except HTTPError as error:
                 if not recoverable_status(error.code):
                     try:
-                        data.write(error.read())
+                        body = error.read()
+                        replacement = None
+                        if error.code == 400 and not max_tokens_adapted:
+                            replacement = _request_with_max_tokens(
+                                request, max_tokens_limit(body)
+                            )
+                        if replacement is not None:
+                            error.close()
+                            request = replacement
+                            max_tokens_adapted = True
+                            self.record(request_id, "max_tokens_adapted", limit=max_tokens_limit(body))
+                            continue
+                        data.write(body)
                         data.seek(0)
                         return (
                             error.code,

@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import textwrap
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -17,6 +18,7 @@ from pier.agents.network import allowlist_from_urls
 from pier.models.agent.network import NetworkAllowlist
 
 # 这里的 _vendor.bitfun_cli 是从 BitFun 官方仓库的 bitfun_cli.py 复制过来的，经过了少量修改以适配 Pier 的环境。
+from .context_policy import requires_patched_runtime, validate_capabilities
 from ._vendor.bitfun_cli import BitfunCli as UpstreamBitfunCli
 
 _VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -47,7 +49,10 @@ def credential_variables(config: dict) -> set[str]:
 
 
 class BitfunCli(UpstreamBitfunCli):
-    """Use BitFun's own coding loop; Pier owns collection and official grading."""
+    """1. Pier 评测 bitfun 的适配器。类方法对应 Pier 要求的接口，如 name，network_allowlist，setup，run 等。
+        给完这些，Pier 就可以正常的完成对 bitfun 这个 agent 的评测。
+       2. 作为后续 bitfun 要完成的其他功能的父类，提供了基础的 bitfun 在 Pier 下怎么配置，运行，后续可以扩展功能。
+    """
 
     def __init__(
         self,
@@ -75,7 +80,7 @@ class BitfunCli(UpstreamBitfunCli):
         return None
 
     def network_allowlist(self) -> NetworkAllowlist:
-        # 阅读配置获取可以访问网络的端口
+        # 通过读取 yaml 文件告知 Pier 可用的模型名称和可访问的模型网络
         models = self._bitfun_config.get("ai", {}).get("models", [])
         urls = []
         for model in models:
@@ -115,7 +120,7 @@ class BitfunCli(UpstreamBitfunCli):
         return result
 
     async def setup(self, environment) -> None:
-        """检查 bitfun binary 是否存在和版本"""
+        """检查 bitfun 信息后，起 DeepSWE 所需的镜像，并按前面的白名单架代理，把宿主机上的 bifun 挂载进容器"""
         result = await environment.exec(
             command=f"test -x {shlex.quote(self._binary_path)} && "
             f"{shlex.quote(self._binary_path)} --version"
@@ -128,13 +133,21 @@ class BitfunCli(UpstreamBitfunCli):
                 f"Expected pinned bitfun 0.2.15, found {self._version!r}"
             )
 
+        if requires_patched_runtime(self._bitfun_config):
+            proof = await environment.exec(
+                command=f"{shlex.quote(self._binary_path)} --context-policy-capabilities"
+            )
+            if proof.return_code:
+                raise RuntimeError("Reference context policy requires the patched BitFun binary")
+            validate_capabilities(proof.stdout or "")
+
         await self.exec_as_agent(
             environment,
             command=f"mkdir -p {shlex.quote(_ROOT)} /logs/agent",
         )
 
     def _build_register_config_command(self) -> str:
-        # 读取配置里的模型 key 的时候，防止 Pier 把 key 写进日志里；解决代理问题
+        # 在容器里面执行 python 脚本，实现替换真实的模型 key，改写 Pier 代理等
         payload = json.dumps(self._bitfun_config)
         script = rf"""
             import json, os, re
@@ -192,10 +205,26 @@ class BitfunCli(UpstreamBitfunCli):
             )
         return result
 
-    def _build_run_shell(self, instruction: str) -> str:
-        # 构建 bitfun 运行命令，解决指定的题目
-        command = super()._build_run_shell(instruction)
-        command = command.replace(" exec --agent ", " exec --auto --agent ", 1)
+    async def upload_prompt(self, environment, prompt: str, name: str) -> str:
+        """Transport user text as bytes, never as a Docker/shell/exec argument."""
+        if Path(name).name != name or not name.endswith(".txt"):
+            raise ValueError("Prompt filename must be a plain .txt basename")
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        source = self.logs_dir / name
+        source.write_bytes(prompt.encode("utf-8"))
+        os.chmod(source, 0o600)
+        remote = f"{_ROOT}/{name}"
+        await environment.upload_file(source, remote)
+        return remote
+
+    def _build_run_shell(self, prompt_path: str) -> str:
+        args = [self._binary_path, "exec", "--auto", "--agent", self._exec_agent]
+        setup = "set -o pipefail\nmkdir -p /logs/agent\n"
+        if self._output_patch_path:
+            args += ["--output-patch", self._output_patch_path]
+            setup += "mkdir -p " + shlex.quote(str(Path(self._output_patch_path).parent)) + "\n"
+        command = (setup + shlex.join(args) + " < " + shlex.quote(prompt_path)
+                   + " 2>&1 | tee /logs/agent/bitfun.txt\nexit ${PIPESTATUS[0]}")
 
         return (
             f"setsid bash -c {shlex.quote(command)} &\n"
@@ -245,9 +274,9 @@ class BitfunCli(UpstreamBitfunCli):
             await self.exec_as_agent(environment, self._build_register_config_command())
             await self._capture_repo_baseline(environment)
             baseline_captured = True
-            await self.exec_as_agent(
-                environment, self._build_run_shell(self.render_instruction(instruction))
-            )
+            prompt_path = await self.upload_prompt(
+                environment, self.render_instruction(instruction), "native-prompt.txt")
+            await self.exec_as_agent(environment, self._build_run_shell(prompt_path))
         except asyncio.CancelledError:
             try:
                 await environment.exec(

@@ -1,4 +1,4 @@
-"""BitFun baseline: shared budget, persistent review, evidence and repair loops."""
+"""bitfun 的 baseline 评测流程"""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from pier.models.agent.context import AgentContext
 from pier.models.task.task import Task
 
 from .bitfun_agent import BitfunCli, credential_variables
+from .context_policy import for_role
 from .completion import actor_evidence_leads, run_completion_checks
 from .contracts import RoleInfrastructureError, TaskBudgetExhausted
 from .prompts import actor_prompt, verifier_prompt
@@ -44,6 +45,7 @@ class BitfunBaseline(BitfunCli):
         command_timeout_sec=600,
         stall_recovery=True,
         allow_role_swap=True,
+        reference_context_policy=False,
         **kwargs,
     ):
         legacy = {
@@ -79,6 +81,9 @@ class BitfunBaseline(BitfunCli):
             raise ValueError("report_recovery_attempts must be between 0 and 5")
         if type(stall_recovery) is not bool or type(allow_role_swap) is not bool:
             raise ValueError("Recovery switches must be booleans")
+        if type(reference_context_policy) is not bool:
+            raise ValueError("reference_context_policy must be a boolean")
+        self.reference_context_policy = reference_context_policy
         self.total_timeout_sec = total_timeout_sec
         self.command_timeout_sec = command_timeout_sec
         self.report_recovery_attempts = report_recovery_attempts
@@ -96,7 +101,10 @@ class BitfunBaseline(BitfunCli):
         return "bitfun-baseline"
 
     def role_configs(self):
-        return {"actor": self._bitfun_config, "verifier": self.verifier_config}
+        return {
+            "actor": for_role(self._bitfun_config, "target_actor", enabled=self.reference_context_policy),
+            "verifier": for_role(self.verifier_config, "verifier", enabled=self.reference_context_policy),
+        }
 
     def network_allowlist(self):
         configs = (
@@ -149,6 +157,7 @@ class BitfunBaseline(BitfunCli):
         ]
         record = {
             "protocol_version": 2,
+            "reference_context_policy": self.reference_context_policy,
             "source_sha256": {
                 str(path.relative_to(Path(__file__).parents[2])): hashlib.sha256(
                     path.read_bytes()
@@ -262,6 +271,7 @@ class BitfunBaseline(BitfunCli):
         evidence_leads="",
         review_id=None,
     ):
+        config = for_role(config, "verifier", enabled=self.reference_context_policy)
         key = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
         destination = self.baseline_dir / "reviews" / (
             review_id or f"round-{round_number:03d}"
@@ -568,6 +578,8 @@ class BitfunBaseline(BitfunCli):
         self._remaining()
         if self.allow_role_swap:
             actor_config, verifier_config = verifier_config, actor_config
+        actor_config = for_role(actor_config, "target_actor", enabled=self.reference_context_policy)
+        verifier_config = for_role(verifier_config, "verifier", enabled=self.reference_context_policy)
         fresh = self._session(self.logs_dir, actor_config)
         await fresh.prepare(environment)
         self.summary["actor_session_ids"].append(fresh.session_id)
@@ -586,9 +598,13 @@ class BitfunBaseline(BitfunCli):
         )
 
     async def run(self, instruction, environment, context):
+        """
+        运行主入口，传入
+        """
         self.baseline_dir.mkdir(parents=True, exist_ok=True)
         self._record_protocol()
-        actor_config, verifier_config = self._bitfun_config, self.verifier_config
+        actor_config = for_role(self._bitfun_config, "target_actor", enabled=self.reference_context_policy)
+        verifier_config = for_role(self.verifier_config, "verifier", enabled=self.reference_context_policy)
         actor = self._session(self.logs_dir, actor_config)
         started = time.monotonic()
         if self._work_budget is None:

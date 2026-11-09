@@ -20,6 +20,8 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import sys
+import traceback
 from typing import Any, Callable
 
 from core.actor import PLAIN_JSON_TRANSPORT_NOTE
@@ -359,9 +361,12 @@ def _execute_branch(
     """Run one isolated Actor -> Verifier branch, leaving its Actor resumable."""
 
     desktop = None
+    stage = "starting"
     try:
+        stage = "acquire_vm"
         desktop, vm = vm_factory()
         wave_memory = _read_memory_tree(str(wave_memory_dir))
+        stage = "replay_fixtures"
         _replay(hooks, vm, str(episode_dir / "fixtures"))
         _push_canonical_memory(hooks, vm, str(wave_memory_dir))
 
@@ -371,6 +376,7 @@ def _execute_branch(
             + _actor_runtime_contract()
         actor_continuation = False
         while True:
+            stage = "actor_handoff"
             actor_decision, actor_history, _ = _run_handoff_phase(
                 hooks=hooks, vm=vm, cfg=actor_cfg, prompt=actor_prompt,
                 role="ACTOR", handoff_path=ACTOR_HANDOFF,
@@ -381,6 +387,7 @@ def _execute_branch(
             actor_continuation = True
             candidate_dir = episode_dir / "candidates/cycle_001"
             try:
+                stage = "capture_candidate"
                 _capture_owned_tree(
                     hooks, vm, f"phase1-candidate-{project_index:03d}",
                     str(candidate_dir), target_direction)
@@ -390,20 +397,24 @@ def _execute_branch(
                     "ACTOR", ACTOR_HANDOFF,
                     f"{PROJECT_ROOT} was absent, empty, or not replayable")
 
+        stage = "actor_execution_evidence"
         _atomic_text(
             episode_dir / "handoffs/actor_001.md", actor_decision.text)
         execution_evidence = _build_actor_execution_evidence(
             episode_dir / "actor", 1,
             episode_dir / "actor_execution_evidence/cycle_001")
 
+        stage = "reset_for_verifier"
         _fresh_vm(hooks, vm, target_direction)
+        stage = "replay_candidate_for_verifier"
         _replay(hooks, vm, str(candidate_dir))
         from core.verifier import VerifierSession, verify_agentic
 
         control_cfg = _branch_control_config(verifier_control_cfg)
         session = VerifierSession()
         try:
-            verdict, findings = (hooks.verify_agentic or verify_agentic)(
+            stage = "verify_agentic"
+            verifier_result = (hooks.verify_agentic or verify_agentic)(
                 project.instruction, vm, control_cfg,
                 sink=ArtifactSink(str(episode_dir / "verifier/cycle_001")),
                 turn_no=project_index,
@@ -413,6 +424,16 @@ def _execute_branch(
                     "hidden by the harness. Investigate the actual candidate "
                     "independently."),
                 session=session, wall_budget=control_cfg.wall_clock_secs)
+            if (not isinstance(verifier_result, tuple)
+                    or len(verifier_result) != 2):
+                raise PracticeInfrastructureError(
+                    "verify_agentic returned "
+                    f"{type(verifier_result).__name__}, expected (verdict, findings): "
+                    f"{verifier_result!r}")
+            verdict, findings = verifier_result
+            if not isinstance(findings, str) or not findings.strip():
+                raise PracticeInfrastructureError(
+                    "verify_agentic returned missing or non-text findings")
         finally:
             session.close_executor()
         if verdict not in {"pass", "wrong"}:
@@ -424,6 +445,7 @@ def _execute_branch(
         _atomic_text(
             episode_dir / "handoffs/verifier_001.md", verifier_report)
 
+        stage = "verify_candidate_integrity"
         _push_actor_execution_evidence(hooks, vm, execution_evidence)
         _verify_candidate(hooks, vm, str(candidate_dir))
         _verify_actor_execution_evidence(vm, execution_evidence)
@@ -431,7 +453,9 @@ def _execute_branch(
         # Throw away Verifier effects and work-phase memory edits, then replay the
         # exact submitted candidate.  The parent later replaces this branch's
         # pre-wave memory with the current canonical bank at its serialized turn.
+        stage = "reset_after_verifier"
         _fresh_vm(hooks, vm, target_direction)
+        stage = "replay_candidate_after_verifier"
         _replay(hooks, vm, str(candidate_dir))
         _push_canonical_memory(hooks, vm, str(wave_memory_dir))
         return _BranchRuntime(
@@ -440,9 +464,20 @@ def _execute_branch(
             actor_history=actor_history, actor_handoff=actor_decision.text,
             verifier_report=verifier_report,
             terminal_outcome=terminal_outcome, wave_memory=wave_memory)
-    except Exception:
+    except Exception as exc:
+        # The caller records the durable branch receipt.  Attach the stage to
+        # the exception without changing its public type/message.
+        try:
+            setattr(exc, "rsi_branch_stage", stage)
+        except Exception:
+            pass
         if desktop is not None:
-            desktop.close()
+            try:
+                desktop.close()
+            except Exception as cleanup_error:
+                exc.add_note(
+                    f"Branch cleanup also failed: {type(cleanup_error).__name__}: "
+                    f"{cleanup_error}")
         raise
 
 
@@ -454,8 +489,29 @@ def _execute_branch_with_infra_retry(**kwargs) -> _BranchRuntime:
     Completed verdicts, memory work, and boundary violations are never retried.
     """
     episode = kwargs["episode_dir"]
+
+    def execute_attempt():
+        try:
+            return _execute_branch(**kwargs)
+        except Exception as exc:
+            # Include initial AND retry failures; preserve the concrete cause
+            # before sibling cancellation. Never retry boundary violations.
+            try:
+                _atomic_json(episode / "branch_exception.json", {
+                    "schema_version": 1,
+                    "project_index": kwargs.get("project_index"),
+                    "project_id": getattr(kwargs.get("project"), "project_id", None),
+                    "stage": getattr(exc, "rsi_branch_stage", "unknown"),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                })
+            except Exception:
+                pass  # Never replace the original failure with a write error.
+            raise
+
     try:
-        return _execute_branch(**kwargs)
+        return execute_attempt()
     except PracticeBoundaryError:
         raise
     except Exception as exc:
@@ -485,7 +541,7 @@ def _execute_branch_with_infra_retry(**kwargs) -> _BranchRuntime:
             "reason": f"{type(exc).__name__}: {exc}",
             "mode": "restart_unscored_branch_from_immutable_fixtures",
             "prior_memory_promoted": False, "maximum_retries": 1})
-    return _execute_branch(**kwargs)
+    return execute_attempt()
 
 
 def _memory_changes(before: dict[str, bytes], after: dict[str, bytes]) \
@@ -559,7 +615,8 @@ def evolve_parallel_phase1(
         max_parallel: int = 4,
         target_query_conditioned: bool = False,
         resume_completed_boundary: bool = False,
-        park_verified_branches: bool = False) -> PracticeResult:
+        park_verified_branches: bool = False,
+        boundary_validator=None) -> PracticeResult:
     """Run persistent-Curriculum parallel waves until Agent saturation.
 
     ``project_budget`` is an undisclosed emergency boundary checked only between
@@ -596,7 +653,7 @@ def evolve_parallel_phase1(
     previous_wave_outcomes = ""
     if resume_completed_boundary:
         from explore.phase1_boundary_recovery import validate_boundary, archive_pending
-        plan = validate_boundary(
+        plan = (boundary_validator or validate_boundary)(
             lineage, target_direction, project_budget=project_budget,
             checkpoint_projects=checkpoint_projects, max_parallel=max_parallel,
             target_query_conditioned=target_query_conditioned)
@@ -693,7 +750,13 @@ def evolve_parallel_phase1(
                     assignments=assignments,
                     target_direction=target_direction)
             finally:
-                curriculum_desktop.close()
+                primary = sys.exception()
+                try:
+                    curriculum_desktop.close()
+                except Exception as cleanup_error:
+                    if primary is None:
+                        raise
+                    primary.add_note(f"Curriculum cleanup also failed: {cleanup_error}")
 
             emit(
                 "PHASE1_WAVE_STARTED", wave=wave_index,
@@ -718,8 +781,16 @@ def evolve_parallel_phase1(
                     for index, project, episode_dir in assignments
                 }
                 for future in as_completed(futures):
+                    if future.cancelled():
+                        continue
                     try:
                         branch = future.result()
+                        completed[branch.project_index] = branch
+                        active_branches.append(branch)
+                        if park_verified_branches:
+                            branch.desktop.close()
+                            branch.desktop = None
+                            branch.vm = None
                     except Exception as exc:
                         branch_errors.append(exc)
                         # Persist immediately: a productive sibling can take
@@ -731,13 +802,11 @@ def evolve_parallel_phase1(
                             error_type=type(exc).__name__, error=str(exc),
                             classification=("boundary" if isinstance(
                                 exc, PracticeBoundaryError) else "infra"))
+                        if len(branch_errors) == 1 and hooks.branch_failure is not None:
+                            hooks.branch_failure(exc)
+                            for pending_future in futures:
+                                pending_future.cancel()
                         continue
-                    completed[branch.project_index] = branch
-                    active_branches.append(branch)
-                    if park_verified_branches:
-                        branch.desktop.close()
-                        branch.desktop = None
-                        branch.vm = None
                     emit(
                         "PHASE1_BRANCH_VERIFIED", wave=wave_index,
                         project=branch.project_index,
@@ -824,6 +893,10 @@ def evolve_parallel_phase1(
     except PracticeBoundaryError as exc:
         return finish("quarantined", str(exc))
     except Exception as exc:  # noqa: BLE001 - persist inspectable infra state
+        _atomic_json(lineage / 'phase_exception.json', {
+            'error_type': type(exc).__name__, 'error': str(exc),
+            'traceback': traceback.format_exc(), 'wave': wave_index,
+            'completed_projects': project_index})
         return finish("infra", f"{type(exc).__name__}: {exc}")
     finally:
         for branch in active_branches:

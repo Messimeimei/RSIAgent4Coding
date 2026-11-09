@@ -24,7 +24,8 @@ def _require(condition, detail):
 
 def validate_boundary(lineage: Path, target: str, *, project_budget,
                       checkpoint_projects, max_parallel,
-                      target_query_conditioned):
+                      target_query_conditioned, history_loader=None,
+                      events_path=None, require_frozen=True):
     from explore.phase1_wave import parse_wave_handoff
 
     state = json.loads((lineage / "state.json").read_text())
@@ -50,8 +51,9 @@ def validate_boundary(lineage: Path, target: str, *, project_budget,
              "a later phase already exists")
     memory = _manifest(_read_memory_tree(str(lineage / "memory")))
     _require(memory == state.get("memory_manifest"), "canonical memory drifted")
-    _require(memory == _manifest(_read_memory_tree(str(lineage / "memory_frozen"))),
-             "frozen memory differs from stopped canonical memory")
+    if require_frozen or (lineage / "memory_frozen").exists():
+        _require(memory == _manifest(_read_memory_tree(str(lineage / "memory_frozen"))),
+                 "frozen memory differs from stopped canonical memory")
 
     records = []
     before = {}
@@ -73,11 +75,12 @@ def validate_boundary(lineage: Path, target: str, *, project_budget,
              "invalid completed wave counter")
     _require(type(state.get("waves")) is int
              and state["waves"] in {last_wave, last_wave + 1}, "wave counter drifted")
-    event_path = lineage / "events.jsonl"
+    event_path = Path(events_path) if events_path is not None else lineage / "events.jsonl"
     _require(not count or event_path.is_file(), "completed-wave event log is missing")
     completed = [json.loads(line) for line in (event_path.read_text() if event_path.is_file() else "").splitlines()
                  if line.strip()]
-    completed = [e for e in completed if e.get("event_type") == "PHASE1_WAVE_COMPLETED"]
+    completed = [e for e in completed
+                 if e.get("event_type", e.get("event")) == "PHASE1_WAVE_COMPLETED"]
     _require((not count and not completed) or (bool(completed)
              and completed[-1]["payload"]["total_projects"] == count
              and completed[-1]["payload"]["wave"] == last_wave),
@@ -99,7 +102,8 @@ def validate_boundary(lineage: Path, target: str, *, project_budget,
             "segment_*/transcript.json"))
         _require(bool(transcripts), "completed Curriculum context is missing")
         last_transcript = max(transcripts, key=lambda p: int(p.parent.name.split("_")[1]))
-        messages = json.loads(last_transcript.read_text()).get("messages")
+        messages = (history_loader(last_transcript) if history_loader else
+                    json.loads(last_transcript.read_text()).get("messages"))
         _require(isinstance(messages, list) and bool(messages)
                  and len(messages) % 2 == 0, "incomplete Curriculum context")
         _require(all(isinstance(message, dict)

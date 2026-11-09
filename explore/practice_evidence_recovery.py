@@ -123,7 +123,10 @@ def run_practice_with_evidence(*, hooks, vm, lineage, episode_dir, project_index
                 history=history, continuation=bool(history), bounded_transport=True)
             actor_used += max(1, len(list(actor_root.glob('segment_*/iter_*/turn.txt'))) - before_turns,
                               int(getattr(result, 'turns', 0) or getattr(result, 'iters', 0)))
-            actor_wall += time.monotonic() - started
+            actor_wall += (time.monotonic() - started
+                           if getattr(hooks, 'role_work_usage', None) is None else
+                           max(0.0, time.monotonic() - started -
+                               float(getattr(result, 'infra_pause_secs', 0.0))))
             publication += 1
             candidate = episode_dir / 'candidate' / f'publication_{publication:03d}'
             require(not candidate.exists(), 'candidate publication already exists')
@@ -153,14 +156,19 @@ def run_practice_with_evidence(*, hooks, vm, lineage, episode_dir, project_index
             before_turns = len(list(verifier_root.glob('verifier_agent/inspection_*/segment_*/iter_*/turn.txt')))
             remaining_wall = verifier_wall_cap - verifier_wall - (time.monotonic() - started)
             require(remaining_wall > 0, 'Verifier setup exhausted remaining budget')
-            verdict, report = (hooks.verify_agentic or verify_agentic)(
+            verdict, report = (getattr(hooks, 'verify_agentic', None) or verify_agentic)(
                 project, vm, control, sink=ArtifactSink(str(verifier_root)),
                 turn_no=project_index, context=context, session=session,
                 wall_budget=remaining_wall, iters_budget=verifier_role.max_iters-verifier_used,
-                actor_evidence_leads=(hooks.actor_evidence_leads or actor_leads)(history, project, actor_cfg) if evidence_requested else '')
-            verifier_wall += time.monotonic() - started
-            verifier_used += max(1, len(list(verifier_root.glob(
-                'verifier_agent/inspection_*/segment_*/iter_*/turn.txt'))) - before_turns)
+                actor_evidence_leads=(getattr(hooks, 'actor_evidence_leads', None) or actor_leads)(history, project, actor_cfg) if evidence_requested else '')
+            if getattr(hooks, 'role_work_usage', None) is None:
+                verifier_wall += time.monotonic() - started
+                verifier_used += max(1, len(list(verifier_root.glob(
+                    'verifier_agent/inspection_*/segment_*/iter_*/turn.txt'))) - before_turns)
+            else:
+                native_iters, infra_pause = hooks.role_work_usage(session)
+                verifier_used += max(1, native_iters)
+                verifier_wall += max(0.0, time.monotonic() - started - infra_pause)
             V._verify_candidate(hooks, vm, str(candidate))
             V._verify_original_practice_fixtures(hooks, vm, fixture_dir)
             require(_manifest(before_memory) == _manifest(

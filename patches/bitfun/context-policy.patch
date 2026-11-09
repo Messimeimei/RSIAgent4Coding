@@ -1,0 +1,1091 @@
+--- a/src/apps/cli/src/main.rs
++++ b/src/apps/cli/src/main.rs
+@@ -1378,6 +1378,16 @@
+ }
+ 
+ fn main() {
++    if std::env::args().nth(1).as_deref() == Some("--context-policy-capabilities") {
++        println!(
++            "{}",
++            serde_json::json!({"schema_version": 1,
++            "implementation": "rsi-context-policy-v1", "modes": ["native", "full_history", "work_log"],
++            "first_turn_window_fix": true, "strict_capacity": true,
++            "persisted_policy": true})
++        );
++        return;
++    }
+     // Install rustls CryptoProvider before any TLS-capable work (relay WS,
+     // reqwest rustls paths, Feishu wss). Required when both ring and aws-lc-rs
+     // are linked: rustls cannot auto-select a provider.
+--- a/src/crates/assembly/core/src/agentic/core/message.rs
++++ b/src/crates/assembly/core/src/agentic/core/message.rs
+@@ -56,6 +56,8 @@
+ 
+ #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+ pub struct MessageMetadata {
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub work_log_state: Option<bitfun_agent_runtime::context_policy::WorkLogState>,
+     pub turn_id: Option<String>,
+     pub round_id: Option<String>,
+     pub tokens: Option<usize>,
+--- a/src/crates/assembly/core/src/agentic/execution/execution_engine.rs
++++ b/src/crates/assembly/core/src/agentic/execution/execution_engine.rs
+@@ -24,6 +24,7 @@
+     ImageLimits,
+ };
+ use crate::agentic::round_preempt::RoundInjectionKind;
++use crate::agentic::session::compression::work_log;
+ use crate::agentic::session::{
+     ContextCompressor, SessionManager, TokenAnchor, TokenAnchorInput, UserContextCacheIdentity,
+ };
+@@ -50,6 +51,7 @@
+ use crate::util::types::Message as AIMessage;
+ use crate::util::types::ToolDefinition;
+ use crate::util::{elapsed_ms_u64, truncate_at_char_boundary};
++use bitfun_agent_runtime::context_policy::{ContextMode, ContextPolicy};
+ use bitfun_agent_runtime::output_surface::TOOL_CONTEXT_INLINE_MARKDOWN_IMAGE_DISPLAY_KEY;
+ use bitfun_agent_runtime::remote_file_delivery::TOOL_CONTEXT_REMOTE_FILE_DELIVERY_KEY;
+ use bitfun_ai_adapters::ModelExchangeTraceConfig;
+@@ -1522,7 +1524,35 @@
+         let finalize_tool_names = Self::finalize_tool_names(input.tool_definitions.as_deref());
+         let finalize_runtime_tool_restrictions =
+             Self::finalize_runtime_tool_restrictions(input.context, &finalize_tool_names);
+-        let mut final_ai_messages = Self::build_ai_messages_for_send(
++        let policy = self
++            .session_manager
++            .get_session(&input.context.session_id)
++            .and_then(|s| s.config.context_policy)
++            .unwrap_or_default();
++        let budget = Self::compression_trigger_budget(
++            input.context_window,
++            input.ai_client.config.max_tokens,
++        );
++        let overhead = Self::prepended_reminder_tokens_for_pressure(input.prepended_reminders)
++            + TokenCounter::estimate_tokens(input.reminder_text)
++            + TokenCounter::estimate_tokens(Self::FINALIZE_USER_FOLLOWUP)
++            + 8;
++        let pressure = Self::estimate_auto_compression_pressure(
++            input.messages,
++            input.tool_definitions.as_deref(),
++            input.context_window,
++            budget,
++            overhead,
++        );
++        policy
++            .check_capacity(
++                pressure.total_tokens,
++                input.context_window,
++                budget.output_reserve_tokens,
++                budget.safety_reserve_tokens,
++            )
++            .map_err(BitFunError::Validation)?;
++        let mut final_ai_messages = Self::build_ai_messages_for_send_with_policy(
+             input.messages,
+             &input.ai_client.config.format,
+             input
+@@ -1533,6 +1563,7 @@
+             &input.context.dialog_turn_id,
+             input.primary_model_facts.supports_image_inputs,
+             input.prepended_reminders,
++            policy.strict(),
+         )
+         .await?;
+         final_ai_messages.push(AIMessage::user(render_system_reminder(input.reminder_text)));
+@@ -1591,8 +1622,31 @@
+         attach_images: bool,
+         prepended_reminders: &[&str],
+     ) -> BitFunResult<Vec<AIMessage>> {
+-        /// Only the last this many **messages** that contain images keep their images for the API.
++        Self::build_ai_messages_for_send_with_policy(
++            messages,
++            provider,
++            workspace_path,
++            current_turn_id,
++            attach_images,
++            prepended_reminders,
++            false,
++        )
++        .await
++    }
++
++    async fn build_ai_messages_for_send_with_policy(
++        messages: &[Message],
++        provider: &str,
++        workspace_path: Option<&Path>,
++        current_turn_id: &str,
++        attach_images: bool,
++        prepended_reminders: &[&str],
++        preserve_history: bool,
++    ) -> BitFunResult<Vec<AIMessage>> {
+         const MAX_IMAGE_BEARING_MESSAGE_ROUNDS: usize = 2;
++        if preserve_history && !attach_images && messages.iter().any(Self::message_bears_images) {
++            return Err(BitFunError::Validation("context_policy_image_unsupported: history contains images but the configured model is text-only".into()));
++        }
+ 
+         let limits = ImageLimits::for_provider(provider);
+ 
+@@ -1610,7 +1664,14 @@
+         let mut prepended_reminders_injected = false;
+ 
+         let keep_image_messages = if attach_images {
+-            Self::image_bearing_indices_to_keep(messages, MAX_IMAGE_BEARING_MESSAGE_ROUNDS)
++            Self::image_bearing_indices_to_keep(
++                messages,
++                if preserve_history {
++                    usize::MAX
++                } else {
++                    MAX_IMAGE_BEARING_MESSAGE_ROUNDS
++                },
++            )
+         } else {
+             HashSet::new()
+         };
+@@ -1690,11 +1751,13 @@
+                             }
+                             let is_current_turn_message =
+                                 msg.metadata.turn_id.as_deref() == Some(current_turn_id);
+-                            if Self::can_fallback_to_text_only(
+-                                images,
+-                                &err,
+-                                is_current_turn_message,
+-                            ) {
++                            if !preserve_history
++                                && Self::can_fallback_to_text_only(
++                                    images,
++                                    &err,
++                                    is_current_turn_message,
++                                )
++                            {
+                                 warn!(
+                                     "Failed to rebuild multimodal payload, falling back to text-only message: message_id={}, provider={}, turn_id={:?}, current_turn_id={}, error={}",
+                                     msg.id, provider, msg.metadata.turn_id, current_turn_id, err
+@@ -1789,6 +1852,194 @@
+         content.push_str("Note: the primary model cannot inspect image pixels directly. If an image path is available, use analyze_image to inspect it, or use a user-provided image skill with that path.\n");
+ 
+         content
++    }
++
++    /// Fold only complete oldest batches after the reference high-water trigger.
++    /// Provider failures propagate; strict modes never fall through to native truncation.
++    async fn apply_work_log_policy(
++        &self,
++        context: &ExecutionContext,
++        messages: &[Message],
++        policy: &ContextPolicy,
++        ai_client: Arc<crate::infrastructure::ai::AIClient>,
++        context_window: usize,
++    ) -> BitFunResult<Option<Vec<Message>>> {
++        if work_log::rendered_chars(messages) <= policy.work_log.ctx_high_water {
++            return Ok(None);
++        }
++        let mut current = messages.to_vec();
++        let mut changed = false;
++        while work_log::rendered_chars(&current) > policy.work_log.ctx_low_water {
++            let Some(plan) = work_log::plan(&current, policy) else {
++                break;
++            };
++            let request_messages = vec![
++                AIMessage::system(work_log::SUMMARIZER_SYSTEM.into()),
++                AIMessage::user(plan.request()),
++            ];
++            let mut summarizer = ai_client.as_ref().clone();
++            summarizer.config.temperature = Some(0.0);
++            // OpenAI/Anthropic adapters use extra_body for sampling overrides.
++            // Set it on this clone only, keeping the actor's sampling unchanged.
++            let mut extra = summarizer
++                .config
++                .custom_request_body
++                .as_ref()
++                .and_then(serde_json::Value::as_object)
++                .cloned()
++                .unwrap_or_default();
++            for key in [
++                "model",
++                "messages",
++                "input",
++                "instructions",
++                "system",
++                "tools",
++                "tool_choice",
++                "functions",
++                "function_call",
++            ] {
++                extra.remove(key);
++            }
++            extra.insert("temperature".into(), serde_json::json!(0.0));
++            summarizer.config.custom_request_body = Some(serde_json::Value::Object(extra));
++            let budget =
++                Self::compression_trigger_budget(context_window, summarizer.config.max_tokens);
++            // Summary requests are independently budgeted and never truncated.
++            let summary_tokens = request_messages
++                .iter()
++                .map(|m| {
++                    TokenCounter::estimate_tokens(&serde_json::to_string(m).unwrap_or_default())
++                })
++                .sum();
++            policy
++                .check_capacity(
++                    summary_tokens,
++                    context_window,
++                    budget.output_reserve_tokens,
++                    budget.safety_reserve_tokens,
++                )
++                .map_err(BitFunError::Validation)?;
++            let compression_id = format!("work_log_{}", uuid::Uuid::new_v4());
++            let started = std::time::Instant::now();
++            let tokens_before: usize = current
++                .iter()
++                .map(|m| m.estimate_tokens_with_reasoning(true))
++                .sum();
++            self.emit_event(
++                AgenticEvent::ContextCompressionStarted {
++                    session_id: context.session_id.clone(),
++                    turn_id: context.dialog_turn_id.clone(),
++                    compression_id: compression_id.clone(),
++                    trigger: "work_log_high_water".into(),
++                    tokens_before,
++                    context_window,
++                },
++                EventPriority::Normal,
++            )
++            .await;
++            let trace_dir = self
++                .session_manager
++                .persistent_model_exchange_trace_dir(&context.session_id)
++                .await;
++            let trace = prepare_model_exchange_trace_for_workspace(
++                &context.session_id,
++                &context.dialog_turn_id,
++                context.workspace.as_ref(),
++                trace_dir.as_deref(),
++                ModelExchangeTraceOperation {
++                    kind: "context_compression",
++                    id: &compression_id,
++                    trigger: Some("work_log_high_water"),
++                },
++                &summarizer,
++            )
++            .await;
++            let raw_summary = match self
++                .request_compression_summary_with_retry(
++                    Arc::new(summarizer),
++                    request_messages,
++                    None,
++                    trace,
++                    2,
++                )
++                .await
++            {
++                Ok(summary) => summary,
++                Err(error) => {
++                    self.emit_event(
++                        AgenticEvent::ContextCompressionFailed {
++                            session_id: context.session_id.clone(),
++                            turn_id: context.dialog_turn_id.clone(),
++                            compression_id,
++                            error: error.to_string(),
++                        },
++                        EventPriority::High,
++                    )
++                    .await;
++                    return Err(error);
++                }
++            };
++            let folded_units = plan.folded_units;
++            let compressed = plan.apply(&raw_summary, policy.work_log.worklog_max_chars);
++            let mut next: Vec<_> = current
++                .iter()
++                .filter(|m| m.role == MessageRole::System)
++                .cloned()
++                .collect();
++            next.extend(compressed.clone());
++            // Keep the full raw turn archive; only the model-visible snapshot changes.
++            self.session_manager
++                .replace_context_messages(&context.session_id, compressed)
++                .await;
++            self.session_manager
++                .invalidate_prompt_cache(
++                    &context.session_id,
++                    crate::agentic::session::PromptCacheScope::All,
++                    "work_log_applied",
++                )
++                .await;
++            if let Some(mut session) = self.session_manager.get_session(&context.session_id) {
++                session.compression_state.increment_compression_count();
++                self.session_manager
++                    .update_compression_state(
++                        &context.session_id,
++                        session.compression_state.clone(),
++                    )
++                    .await?;
++                let tokens_after = next
++                    .iter()
++                    .map(|m| m.estimate_tokens_with_reasoning(true))
++                    .sum::<usize>();
++                self.emit_event(
++                    AgenticEvent::ContextCompressionCompleted {
++                        session_id: context.session_id.clone(),
++                        turn_id: context.dialog_turn_id.clone(),
++                        compression_id,
++                        compression_count: session.compression_state.compression_count,
++                        tokens_before,
++                        tokens_after,
++                        compression_ratio: tokens_after as f64 / tokens_before.max(1) as f64,
++                        duration_ms: elapsed_ms_u64(started),
++                        has_summary: !raw_summary.trim().is_empty(),
++                        summary_source: if raw_summary.trim().is_empty() {
++                            "reference_digest"
++                        } else {
++                            "model_work_log"
++                        }
++                        .into(),
++                        applied: true,
++                    },
++                    EventPriority::Normal,
++                )
++                .await;
++            }
++            info!("Work log applied: session_id={}, folded_units={}, characters_before={}, characters_after={}",
++                context.session_id, folded_units, work_log::rendered_chars(&current), work_log::rendered_chars(&next));
++            current = next;
++            changed = true;
++        }
++        Ok(changed.then_some(current))
+     }
+ 
+     async fn build_compression_request_messages(
+@@ -2529,6 +2780,16 @@
+             .session_manager
+             .get_session(&session_id)
+             .ok_or_else(|| BitFunError::NotFound(format!("Session not found: {}", session_id)))?;
++        if session
++            .config
++            .context_policy
++            .as_ref()
++            .is_some_and(ContextPolicy::strict)
++        {
++            return Err(BitFunError::Validation(
++                "Manual compaction is disabled by the persisted context policy".into(),
++            ));
++        }
+         let start_time = std::time::Instant::now();
+         let scaffold = self
+             .resolve_compression_runtime_scaffold(&session, &context)
+@@ -3224,12 +3485,21 @@
+                 .collect::<Vec<_>>()
+         );
+ 
+-        let enable_context_compression = session.config.enable_context_compression;
++        let context_policy = session.config.context_policy.clone().unwrap_or_default();
++        context_policy.validate().map_err(BitFunError::Validation)?;
++        let enable_context_compression =
++            session.config.enable_context_compression && context_policy.mode == ContextMode::Native;
+         let compression_trigger_budget =
+             Self::compression_trigger_budget(context_window, ai_client.config.max_tokens);
+ 
+         // If the primary model is text-only, do not send image payloads to the provider.
+         // Instead, keep a text-only placeholder (including `image_id`).
++        if context_policy.strict()
++            && !primary_supports_image_understanding
++            && messages.iter().any(Self::message_bears_images)
++        {
++            return Err(BitFunError::Validation("context_policy_image_unsupported: history contains images but the configured model is text-only".into()));
++        }
+         if !primary_supports_image_understanding {
+             for msg in messages.iter_mut() {
+                 let MessageContent::Multimodal { text, images } = &msg.content else {
+@@ -3256,6 +3526,22 @@
+                 );
+                 finalization_reason = Some("max_rounds");
+                 break;
++            }
++
++            if context_policy.mode == ContextMode::WorkLog {
++                if let Some(updated) = self
++                    .apply_work_log_policy(
++                        &context,
++                        &messages,
++                        &context_policy,
++                        ai_client.clone(),
++                        context_window,
++                    )
++                    .await?
++                {
++                    messages = updated;
++                    full_compression_count += 1;
++                }
+             }
+ 
+             // Check and compress before sending AI request
+@@ -3486,6 +3772,24 @@
+                     send_prepended_reminder_tokens,
+                 )
+             };
++            if let Err(error) = context_policy.check_capacity(
++                send_pressure.total_tokens,
++                context_window,
++                compression_trigger_budget.output_reserve_tokens,
++                compression_trigger_budget.safety_reserve_tokens,
++            ) {
++                self.session_manager
++                    .replace_context_messages(
++                        &context.session_id,
++                        messages
++                            .iter()
++                            .filter(|m| m.role != MessageRole::System)
++                            .cloned()
++                            .collect(),
++                    )
++                    .await;
++                return Err(BitFunError::Validation(error));
++            }
+             if send_pressure.total_tokens > context_window {
+                 warn!(
+                     "Round {} tokens ({}) still exceed context_window ({}) after compression, performing emergency truncation",
+@@ -3580,7 +3884,7 @@
+                 messages.len()
+             );
+ 
+-            let ai_messages = Self::build_ai_messages_for_send(
++            let ai_messages = Self::build_ai_messages_for_send_with_policy(
+                 &messages,
+                 &ai_client.config.format,
+                 context
+@@ -3590,6 +3894,7 @@
+                 &context.dialog_turn_id,
+                 primary_supports_image_understanding,
+                 &send_prepended_reminders,
++                context_policy.strict(),
+             )
+             .await?;
+ 
+--- a/src/crates/assembly/core/src/agentic/session/compression/mod.rs
++++ b/src/crates/assembly/core/src/agentic/session/compression/mod.rs
+@@ -12,6 +12,7 @@
+ 
+ pub mod compressor;
+ pub mod fallback;
++pub mod work_log;
+ 
+ pub use compressor::*;
+ pub use fallback::*;
+--- /dev/null
++++ b/src/crates/assembly/core/src/agentic/session/compression/work_log.rs
+@@ -0,0 +1,339 @@
++//! Reference-style WORK LOG planning over complete assistant/tool exchanges.
++//! One coding exchange maps to one reference action/observation pair. A user
++//! dialog turn can contain hundreds of these exchanges and is not a fold unit.
++use crate::agentic::core::{Message, MessageContent, MessageRole, MessageSemanticKind};
++use bitfun_agent_runtime::context_policy::{ContextPolicy, WorkLogState};
++
++pub const SUMMARIZER_SYSTEM: &str = include_str!("work_log_prompt.txt");
++
++fn content_text(message: &Message) -> String {
++    match &message.content {
++        MessageContent::Text(text) | MessageContent::Multimodal { text, .. } => text.clone(),
++        MessageContent::Mixed {
++            text, tool_calls, ..
++        } => {
++            let mut out = text.clone();
++            for call in tool_calls {
++                out.push_str(&format!("\n{} {}", call.tool_name, call.arguments));
++            }
++            out
++        }
++        MessageContent::ToolResult {
++            result,
++            result_for_assistant,
++            ..
++        } => result_for_assistant
++            .clone()
++            .filter(|s| !s.is_empty())
++            .unwrap_or_else(|| result.to_string()),
++    }
++}
++
++fn reasoning_chars(message: &Message) -> usize {
++    match &message.content {
++        MessageContent::Mixed {
++            reasoning_content: Some(reasoning),
++            ..
++        } => reasoning.chars().count(),
++        _ => 0,
++    }
++}
++
++pub fn rendered_chars(messages: &[Message]) -> usize {
++    messages
++        .iter()
++        .filter(|m| m.role != MessageRole::System)
++        .map(|m| {
++            // The task is independently pinned, matching the reference size trigger.
++            m.metadata.work_log_state.as_ref().map_or_else(
++                || content_text(m).chars().count() + reasoning_chars(m),
++                |state| state.summary.chars().count(),
++            )
++        })
++        .sum()
++}
++
++fn fold_input(text: &str) -> String {
++    let chars: Vec<char> = text.chars().collect();
++    if chars.len() <= 4_000 {
++        return text.to_owned();
++    }
++    format!(
++        "{}\n…[trace middle elided]…\n{}",
++        chars[..1_500].iter().collect::<String>(),
++        chars[chars.len() - 2_500..].iter().collect::<String>()
++    )
++}
++
++pub struct WorkLogPlan {
++    pub task: String,
++    pub previous_summary: String,
++    pub folded_units: usize,
++    pub batch: Vec<Message>,
++    pub tail: Vec<Message>,
++}
++
++impl WorkLogPlan {
++    pub fn request(&self) -> String {
++        let rendered = self
++            .batch
++            .iter()
++            .map(|m| {
++                format!(
++                    "[{}]\n{}",
++                    if m.role == MessageRole::Assistant {
++                        "YOU"
++                    } else {
++                        "ENV"
++                    },
++                    fold_input(&content_text(m))
++                )
++            })
++            .collect::<Vec<_>>()
++            .join("\n\n");
++        format!(
++            "CURRENT LOG:\n{}\n\nOLDER TURNS TO FOLD IN:\n{}\n\nOutput the updated log only.",
++            if self.previous_summary.is_empty() {
++                "(empty)"
++            } else {
++                &self.previous_summary
++            },
++            rendered
++        )
++    }
++
++    pub fn apply(self, raw_summary: &str, cap: usize) -> Vec<Message> {
++        let summary = if raw_summary.trim().is_empty() {
++            // Same starvation fallback as the reference: oldest folded pairs
++            // become explicit digest lines; this is never used for API errors.
++            let digest = self
++                .batch
++                .iter()
++                .map(|m| {
++                    format!(
++                        "[{}] {}",
++                        if m.role == MessageRole::Assistant {
++                            "you"
++                        } else {
++                            "env"
++                        },
++                        content_text(m)
++                            .split_whitespace()
++                            .collect::<Vec<_>>()
++                            .join(" ")
++                            .chars()
++                            .take(220)
++                            .collect::<String>()
++                    )
++                })
++                .collect::<Vec<_>>()
++                .join("\n");
++            let combined = format!("{}\n{}", self.previous_summary, digest);
++            let chars: Vec<char> = combined.chars().collect();
++            if chars.len() > cap {
++                let tail: String = chars[chars.len() - cap..].iter().collect();
++                tail.split_once('\n')
++                    .map_or(tail.clone(), |(_, rest)| rest.to_owned())
++            } else {
++                combined
++            }
++        } else {
++            cap_worklog(raw_summary.trim(), cap)
++        };
++        let content = format!("TASK (verbatim, unchanged — this is the actual goal):\n{}\n\nWORK LOG — your running summary of earlier turns (full details live in the machine; re-probe if you need specifics):\n{}", self.task, summary);
++        let mut message =
++            Message::user(content).with_semantic_kind(MessageSemanticKind::CompressionSummary);
++        message.metadata.work_log_state = Some(WorkLogState {
++            task: self.task,
++            summary,
++            folded_units: self.folded_units,
++        });
++        let mut messages = vec![message];
++        messages.extend(self.tail);
++        messages
++    }
++}
++
++fn cap_worklog(text: &str, cap: usize) -> String {
++    if text.chars().count() <= cap {
++        return text.to_owned();
++    }
++    let prefix: String = text.chars().take(cap).collect();
++    let cut = prefix
++        .rfind('\n')
++        .filter(|i| prefix[..*i].chars().count() >= cap / 2)
++        .unwrap_or(prefix.len());
++    format!("{}\n[... WORK LOG truncated at the char cap — least-important (re-derivable) detail dropped; the machine still holds ground truth, re-probe if needed]", prefix[..cut].trim_end())
++}
++
++/// Returns one oldest complete batch, leaving the protected recent exchanges
++/// and all in-flight user/tool messages intact. Caller owns high/low hysteresis.
++pub fn plan(messages: &[Message], policy: &ContextPolicy) -> Option<WorkLogPlan> {
++    let state = messages
++        .iter()
++        .find_map(|m| m.metadata.work_log_state.clone());
++    let task = state.as_ref().map(|s| s.task.clone()).or_else(|| {
++        messages
++            .iter()
++            .find(|m| m.is_actual_user_message())
++            .map(content_text)
++    })?;
++    let history: Vec<Message> = messages
++        .iter()
++        .filter(|m| m.role != MessageRole::System && m.metadata.work_log_state.is_none())
++        .cloned()
++        .collect();
++    let mut ends = Vec::new();
++    let mut sizes = Vec::new();
++    let mut start = 0;
++    let mut i = 0;
++    while i < history.len() {
++        if history[i].role != MessageRole::Assistant {
++            i += 1;
++            continue;
++        }
++        i += 1;
++        while i < history.len() && history[i].role == MessageRole::Tool {
++            i += 1;
++        }
++        ends.push(i);
++        sizes.push(
++            history[start..i]
++                .iter()
++                .map(|m| content_text(m).chars().count())
++                .sum(),
++        );
++        start = i;
++    }
++    let keep = policy.retained_units(&sizes);
++    let batch = policy.work_log.fold_batch;
++    if ends.len().saturating_sub(keep) < batch {
++        return None;
++    }
++    let cutoff = ends[batch - 1];
++    Some(WorkLogPlan {
++        task,
++        previous_summary: state
++            .as_ref()
++            .map(|s| s.summary.clone())
++            .unwrap_or_default(),
++        folded_units: state.map(|s| s.folded_units).unwrap_or_default() + batch,
++        batch: history[..cutoff].to_vec(),
++        tail: history[cutoff..].to_vec(),
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use bitfun_agent_runtime::context_policy::ContextMode;
++    fn history(n: usize) -> Vec<Message> {
++        let mut messages = vec![Message::user("TASK αβ exact 123".into())
++            .with_semantic_kind(MessageSemanticKind::ActualUserInput)];
++        for i in 0..n {
++            messages.push(Message::assistant(format!("action {i}")));
++            messages.push(Message::user(format!("observation {i}")));
++        }
++        messages
++    }
++    fn policy() -> ContextPolicy {
++        let mut p = ContextPolicy {
++            mode: ContextMode::WorkLog,
++            ..Default::default()
++        };
++        p.work_log.history_keep_pairs = 6;
++        p
++    }
++    #[test]
++    fn full_batch_floor_and_verbatim_tail() {
++        assert!(plan(&history(15), &policy()).is_none());
++        let original = history(16);
++        let p = plan(&original, &policy()).unwrap();
++        assert_eq!(p.folded_units, 10);
++        let tail_ids: Vec<_> = p.tail.iter().map(|m| m.id.clone()).collect();
++        let compressed = p.apply("CURRENT STATE: exact", 500_000);
++        assert!(content_text(&compressed[0]).contains("TASK αβ exact 123"));
++        assert_eq!(
++            compressed[1..]
++                .iter()
++                .map(|m| m.id.clone())
++                .collect::<Vec<_>>(),
++            tail_ids
++        );
++        let restored: Vec<Message> =
++            serde_json::from_str(&serde_json::to_string(&compressed).unwrap()).unwrap();
++        assert_eq!(
++            restored[0]
++                .metadata
++                .work_log_state
++                .as_ref()
++                .unwrap()
++                .folded_units,
++            10
++        );
++    }
++    #[test]
++    fn tool_calls_and_results_are_atomic_and_pending_input_is_preserved() {
++        use crate::agentic::core::{ToolCall, ToolResult};
++        let mut messages = vec![Message::user("TASK exact".into())
++            .with_semantic_kind(MessageSemanticKind::ActualUserInput)];
++        for i in 0..16 {
++            let calls = (0..2)
++                .map(|j| ToolCall {
++                    tool_id: format!("call-{i}-{j}"),
++                    tool_name: "Shell".into(),
++                    arguments: serde_json::json!({"command": format!("echo {i}-{j}")}),
++                    ..Default::default()
++                })
++                .collect::<Vec<_>>();
++            messages.push(Message::assistant_with_tools(
++                format!("action {i}"),
++                calls.clone(),
++            ));
++            for call in calls {
++                messages.push(Message::tool_result(ToolResult {
++                    tool_id: call.tool_id,
++                    tool_name: call.tool_name,
++                    effective_tool_name: None,
++                    result: serde_json::json!("observation"),
++                    result_for_assistant: None,
++                    is_error: false,
++                    duration_ms: None,
++                    image_attachments: None,
++                }));
++            }
++        }
++        let pending = Message::user("FOLLOWUP exact".into());
++        messages.push(pending.clone());
++        let p = plan(&messages, &policy()).unwrap();
++        assert_eq!(p.batch.len(), 1 + 10 * 3);
++        assert_eq!(p.tail.len(), 6 * 3 + 1);
++        assert_eq!(p.tail[0].role, MessageRole::Assistant);
++        assert_eq!(p.tail.last().unwrap().id, pending.id);
++        let compressed = p.apply("summary", 500_000);
++        let restored: Vec<Message> =
++            serde_json::from_str(&serde_json::to_string(&compressed).unwrap()).unwrap();
++        assert!(plan(&restored, &policy()).is_none());
++        assert_eq!(
++            restored[0].metadata.work_log_state.as_ref().unwrap().task,
++            "TASK exact"
++        );
++    }
++    #[test]
++    fn unicode_head_tail_and_log_cap() {
++        let text = "汉".repeat(5000);
++        let folded = fold_input(&text);
++        assert!(folded.starts_with(&"汉".repeat(1500)));
++        assert!(folded.ends_with(&"汉".repeat(2500)));
++        assert!(cap_worklog(&text, 100).starts_with(&"汉".repeat(100)));
++    }
++    #[test]
++    fn empty_summary_uses_reference_digest_and_reasoning_counts() {
++        let p = plan(&history(16), &policy()).unwrap();
++        let compressed = p.apply("", 500_000);
++        assert!(content_text(&compressed[0]).contains("[you] action 0"));
++        let message =
++            Message::assistant_with_reasoning(Some("reason".repeat(100)), "x".into(), vec![]);
++        assert!(rendered_chars(&[message]) >= 601);
++    }
++}
+--- /dev/null
++++ b/src/crates/assembly/core/src/agentic/session/compression/work_log_prompt.txt
+@@ -0,0 +1,10 @@
++You maintain the WORK LOG of your own earlier turns on a long task — the log replaces those turns in your context, so anything you drop is gone from view (the machine itself still holds ground truth).
++
++You are given the CURRENT LOG and a batch of OLDER TURNS to fold in. Output the UPDATED LOG only. Rules:
++- Record only what actually appears in the turns. NEVER invent, infer or embellish.
++- Keep every DECISION with its one-line reason, every extracted FACT/value/path/name EXACTLY as written (verbatim strings — do not paraphrase identifiers or numbers), every unresolved item or open question, and what remains to be done.
++- Dead ends and repetition: one line each ("tried X — failed because Y").
++- Prefer merging into existing entries over duplicating them.
++- ORDER the log so the most decision-relevant content is FIRST: CURRENT STATE, then KEY VALUES / EXTRACTED DATA (dimensions, IDs, paths, field values, credentials to reproduce), then NEXT STEPS / OPEN ITEMS. Put tool/format/reference notes that could be re-derived from files on the machine LAST.
++- If unsure whether something matters, KEEP it in the original wording.
++- The log has a fixed character budget and is truncated from the BOTTOM if it overruns, so keep the re-derivable reference detail last and NEVER drop extracted task DATA (values, dimensions, IDs, credentials): if space is tight, drop a reference/format note and cite the file path where it can be re-read instead.
+\ No newline at end of file
+--- a/src/crates/assembly/core/src/agentic/session/session_manager.rs
++++ b/src/crates/assembly/core/src/agentic/session/session_manager.rs
+@@ -2204,6 +2204,19 @@
+         };
+         session.created_by = created_by;
+         session.kind = kind;
++        // Resolve the window before any executor clones this session. CLI event
++        // projection is too late: one dialog can contain hundreds of rounds.
++        if let Ok(service) = get_global_config_service().await {
++            let ai_config: crate::service::config::types::AIConfig =
++                service.get_config(Some("ai")).await?;
++            Self::sync_session_context_window_from_ai_config(&mut session, &ai_config);
++            if session.config.context_policy.is_none() {
++                session.config.context_policy = Some(ai_config.context_policy);
++            }
++        }
++        if let Some(policy) = &session.config.context_policy {
++            policy.validate().map_err(BitFunError::Validation)?;
++        }
+         let persist = self.config.enable_persistence
+             && !transient
+             && Self::should_persist_session_kind(session.kind);
+@@ -4816,6 +4829,18 @@
+         );
+ 
+         let ai_config_for_restore = Self::load_ai_config_for_model_resolution().await;
++        if ai_config_for_restore
++            .as_ref()
++            .is_some_and(|c| c.context_policy.strict())
++            && !session
++                .config
++                .context_policy
++                .as_ref()
++                .is_some_and(|p| p.strict())
++        {
++            return Err(BitFunError::Validation(
++                "context_policy_migration_required: cannot resume a native/legacy session under a reference policy; start a fresh session so previously compressed history is not misrepresented".into()));
++        }
+         let mut should_persist_restored_session = false;
+         let mut auto_migrated_model_id = None;
+ 
+--- a/src/crates/assembly/core/src/service/config/types.rs
++++ b/src/crates/assembly/core/src/service/config/types.rs
+@@ -604,7 +604,9 @@
+ #[serde(tag = "kind", rename_all = "snake_case")]
+ #[derive(Default)]
+ pub enum SubagentModelSelection {
+-    Fixed { model_id: String },
++    Fixed {
++        model_id: String,
++    },
+     #[default]
+     Inherit,
+ }
+@@ -623,7 +625,6 @@
+         }
+     }
+ }
+-
+ 
+ /// Model defaults for subagents created through user-visible delegation.
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -735,6 +736,8 @@
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ #[serde(default)]
+ pub struct AIConfig {
++    /// Default context policy for newly created sessions.
++    pub context_policy: bitfun_agent_runtime::context_policy::ContextPolicy,
+     /// All configured models.
+     pub models: Vec<AIModelConfig>,
+ 
+@@ -1852,6 +1855,7 @@
+ impl Default for AIConfig {
+     fn default() -> Self {
+         Self {
++            context_policy: Default::default(),
+             models: vec![],
+             func_agent_models: std::collections::HashMap::new(),
+             default_models: DefaultModelsConfig::default(),
+--- /dev/null
++++ b/src/crates/execution/agent-runtime/src/context_policy.rs
+@@ -0,0 +1,152 @@
++//! Persisted context policy. Native behavior remains the default for old sessions.
++use serde::{Deserialize, Serialize};
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum ContextMode {
++    #[default]
++    Native,
++    FullHistory,
++    WorkLog,
++}
++
++#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default, deny_unknown_fields)]
++pub struct ContextPolicy {
++    pub mode: ContextMode,
++    pub work_log: WorkLogConfig,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default, deny_unknown_fields)]
++pub struct WorkLogConfig {
++    pub history_keep_pairs: usize,
++    pub keep_chars: usize,
++    pub ctx_high_water: usize,
++    pub ctx_low_water: usize,
++    pub fold_batch: usize,
++    pub worklog_max_chars: usize,
++}
++
++impl Default for WorkLogConfig {
++    fn default() -> Self {
++        Self {
++            history_keep_pairs: 80,
++            keep_chars: 500_000,
++            ctx_high_water: 900_000,
++            ctx_low_water: 500_000,
++            fold_batch: 10,
++            worklog_max_chars: 500_000,
++        }
++    }
++}
++
++impl ContextPolicy {
++    pub fn validate(&self) -> Result<(), String> {
++        if self.mode == ContextMode::WorkLog {
++            let c = &self.work_log;
++            if c.history_keep_pairs < 6
++                || c.fold_batch == 0
++                || c.worklog_max_chars == 0
++                || c.ctx_low_water == 0
++                || c.ctx_high_water <= c.ctx_low_water
++            {
++                return Err("Invalid work_log policy: keep at least six rounds, use positive batch/log/low-water values and high_water > low_water".into());
++            }
++        }
++        Ok(())
++    }
++
++    /// The recent window is measured in characters, with the reference six-pair floor.
++    pub fn retained_units(&self, content_chars: &[usize]) -> usize {
++        let c = &self.work_log;
++        let mut chars = 0usize;
++        let mut keep = 0usize;
++        for size in content_chars.iter().rev() {
++            if keep >= c.history_keep_pairs
++                || (keep >= 6 && c.keep_chars > 0 && chars.saturating_add(*size) > c.keep_chars)
++            {
++                break;
++            }
++            chars = chars.saturating_add(*size);
++            keep += 1;
++        }
++        keep
++    }
++
++    pub fn strict(&self) -> bool {
++        self.mode != ContextMode::Native
++    }
++
++    pub fn check_capacity(
++        &self,
++        input: usize,
++        window: usize,
++        output: usize,
++        safety: usize,
++    ) -> Result<(), String> {
++        let limit = window.checked_sub(output.saturating_add(safety));
++        if self.strict() && limit.is_none_or(|limit| input > limit) {
++            return Err(format!("context_capacity_exceeded: policy={:?}, input_tokens={}, context_window={}, output_reserve={}, safety_reserve={}; history preserved; no native compression or truncation applied", self.mode, input, window, output, safety));
++        }
++        Ok(())
++    }
++}
++
++/// Stored on the synthetic WORK LOG message so snapshots and forks retain state.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct WorkLogState {
++    pub task: String,
++    pub summary: String,
++    pub folded_units: usize,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn policy_defaults_and_validation() {
++        assert_eq!(
++            serde_json::from_str::<ContextPolicy>("{}").unwrap().mode,
++            ContextMode::Native
++        );
++        assert!(serde_json::from_str::<ContextPolicy>(r#"{"mode":"ful_history"}"#).is_err());
++        assert!(
++            serde_json::from_str::<ContextPolicy>(r#"{"mode":"full_history","typo":1}"#).is_err()
++        );
++        let mut p = ContextPolicy {
++            mode: ContextMode::WorkLog,
++            ..Default::default()
++        };
++        assert!(p.validate().is_ok());
++        p.work_log.fold_batch = 0;
++        assert!(p.validate().is_err());
++    }
++    #[test]
++    fn keep_window_has_floor_ceiling_and_character_budget() {
++        let p = ContextPolicy {
++            mode: ContextMode::WorkLog,
++            ..Default::default()
++        };
++        assert_eq!(p.retained_units(&vec![100; 100]), 80);
++        assert_eq!(p.retained_units(&vec![100_000; 100]), 6);
++        assert_eq!(p.retained_units(&vec![50_000; 100]), 10);
++        assert_eq!(p.retained_units(&[900_000; 2]), 2);
++    }
++    #[test]
++    fn strict_capacity_reserves_output_and_never_drops_history() {
++        let p = ContextPolicy {
++            mode: ContextMode::FullHistory,
++            ..Default::default()
++        };
++        assert!(p.check_capacity(52_592, 128_128, 65_536, 10_000).is_ok());
++        assert!(p
++            .check_capacity(52_593, 128_128, 65_536, 10_000)
++            .unwrap_err()
++            .contains("history preserved"));
++        assert!(p.check_capacity(1, 100, 101, 0).is_err());
++        assert!(ContextPolicy::default()
++            .check_capacity(999_999, 100, 101, 0)
++            .is_ok());
++    }
++}
+--- a/src/crates/execution/agent-runtime/src/lib.rs
++++ b/src/crates/execution/agent-runtime/src/lib.rs
+@@ -5,6 +5,7 @@
+ 
+ pub mod agents;
+ pub mod checkpoint;
++pub mod context_policy;
+ pub mod context_profile;
+ pub mod custom_agent;
+ pub mod custom_subagent;
+--- a/src/crates/execution/agent-runtime/src/session.rs
++++ b/src/crates/execution/agent-runtime/src/session.rs
+@@ -149,6 +149,9 @@
+ /// Session configuration
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct SessionConfig {
++    /// Frozen at session creation; absent for legacy native sessions.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub context_policy: Option<crate::context_policy::ContextPolicy>,
+     pub max_context_tokens: usize,
+     pub auto_compact: bool,
+     pub enable_tools: bool,
+@@ -206,6 +209,7 @@
+ impl Default for SessionConfig {
+     fn default() -> Self {
+         Self {
++            context_policy: None,
+             max_context_tokens: 128128,
+             auto_compact: true,
+             enable_tools: true,

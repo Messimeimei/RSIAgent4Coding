@@ -162,13 +162,13 @@ def test_report_symlink_rejected(tmp_path):
 
 def test_session_commands_preserve_identity(tmp_path, model):
     session = BitfunSession(logs_dir=tmp_path, bitfun_config=model)
-    prompt = 'review `touch BAD` and $(touch BAD) with "quotes"'
-    command = shlex.split(session.command(prompt).split(" &\n")[0])[-1]
+    prompt_path = '/tmp/rsiagent-bitfun/prompt.txt'
+    command = shlex.split(session.command(prompt_path).split(" &\n")[0])[-1]
     assert "--session-id " + session.session_id in command
-    assert shlex.quote(prompt) in command
+    assert '< ' + shlex.quote(prompt_path) in command
     assert "--output-format stream-json" in command
     session.calls = 1
-    resumed = shlex.split(session.command(prompt).split(" &\n")[0])[-1]
+    resumed = shlex.split(session.command(prompt_path).split(" &\n")[0])[-1]
     assert "--resume " + session.session_id in resumed
     assert f"stream-{session.session_id}-002.jsonl" in resumed
 
@@ -183,7 +183,7 @@ async def test_timeout_is_not_unverified_and_settles_process(tmp_path, model):
 
     session.exec_as_agent = work
     session.stop = AsyncMock(side_effect=lambda *args, **kw: settled.set())
-    result = await session.execute(object(), "task", 0.01, role="actor", handoff_id="a")
+    result = await session.execute(SimpleNamespace(upload_file=AsyncMock()), "task", 0.01, role="actor", handoff_id="a")
     assert result.status == "budget_exhausted" and result.report is None
     assert settled.is_set()
     session.stop.assert_awaited_once()
@@ -210,7 +210,7 @@ async def test_handoff_detected_before_natural_exit(tmp_path, model):
 
     session.exec_as_agent = work
     session.stop = AsyncMock(side_effect=lambda *args, **kw: ended.set())
-    result = await session.execute(object(), "task", 3, role="actor", handoff_id="a")
+    result = await session.execute(SimpleNamespace(upload_file=AsyncMock()), "task", 3, role="actor", handoff_id="a")
     assert result.status == "handoff" and ended.is_set()
 
 
@@ -543,8 +543,10 @@ async def test_unchanged_actor_enforced(controller):
 
 
 @pytest.mark.asyncio
-async def test_stagnation_refreshes_context_and_swaps_roles_once(controller, model):
+@pytest.mark.parametrize("reference_context_policy", [False, True])
+async def test_stagnation_refreshes_context_and_swaps_roles_once(controller, model, reference_context_policy):
     obj, actors, state, env = controller
+    obj.reference_context_policy = reference_context_policy
     obj.verifier_config = {**model, "marker": "reviewer"}
     configs = []
     original = obj._session
@@ -576,6 +578,10 @@ async def test_stagnation_refreshes_context_and_swaps_roles_once(controller, mod
     assert obj._verify.call_args_list[0].args[4]["marker"] == "reviewer"
     assert "marker" not in obj._verify.call_args_list[1].args[4]
     assert obj.summary["stall_reviews"][0]["verdict"] == "FAIL"
+    if reference_context_policy:
+        assert all(c["ai"]["context_policy"]["mode"] == "work_log" for c in configs)
+        assert all(call.args[4]["ai"]["context_policy"]["mode"] == "full_history"
+                   for call in obj._verify.call_args_list)
 
 
 @pytest.mark.asyncio
@@ -722,7 +728,7 @@ async def test_native_round_cap_is_a_segment_not_report_error(tmp_path, model):
         )
 
     session.exec_as_agent = work
-    outcome = await session.execute(object(), "task", 3, role="actor", handoff_id="a")
+    outcome = await session.execute(SimpleNamespace(upload_file=AsyncMock()), "task", 3, role="actor", handoff_id="a")
     assert outcome.status == "segment_exhausted"
     assert outcome.metrics["native_finish_reason"] == "max_rounds"
 

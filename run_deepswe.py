@@ -16,12 +16,14 @@ ROOT = Path(__file__).resolve().parent
 AGENT_PLUGINS = {
     "native": "benchmarks.deepswe.bitfun_agent:BitfunCli",
     "baseline": "benchmarks.deepswe.baseline:BitfunBaseline",
+    "rsi": "benchmarks.deepswe.rsi:BitfunRSI",
 }
 
 
 def select_config(mode, path=None):
     # 默认的配置文件路径，可传入 --config 覆盖
-    filename = "baseline-bitfun.yaml" if mode == "baseline" else "dateutil-bitfun.yaml"
+    filename = {"baseline": "baseline-bitfun.yaml", "rsi": "rsi-bitfun.yaml"}.get(
+        mode, "dateutil-bitfun.yaml")
     return path if path is not None else ROOT / "config/deepswe" / filename
 
 
@@ -129,14 +131,33 @@ async def check_job(config, *, root=ROOT, require_credentials=False):
             digest = sha256(source)
             binaries[target]["sha256"] = digest
             if digest != pins["bitfun_binary_sha256"]:
-                blockers.append("BitFun binary differs from the pinned release")
+                if all(a.kwargs.get("reference_context_policy") is True for a in config.agents):
+                    from benchmarks.deepswe.context_policy import verify_build_receipt
+                    try:
+                        receipt = verify_build_receipt(
+                            source, source.with_name(source.name + ".receipt.json"), root
+                        )
+                        binaries[target]["context_policy_build"] = receipt
+                    except (OSError, ValueError, KeyError, TypeError) as error:
+                        blockers.append(f"Invalid BitFun context-policy build: {error}")
+                else:
+                    blockers.append("BitFun binary differs from the pinned release")
+            elif any(a.kwargs.get("reference_context_policy") for a in config.agents):
+                blockers.append("Reference context policy requires a separately built patched BitFun")
 
 
     agents = []
+    resume = None
     for agent_config in config.agents:
         agent = AgentFactory.create_agent_from_config(
             agent_config, logs_dir=root / "results/deepswe/preflight-not-created"
         )
+        if getattr(agent, "resume_from", None) is not None:
+            from benchmarks.deepswe.rsi_resume import inspect_resume, resume_summary
+            try:
+                resume = resume_summary(inspect_resume(agent.resume_from, owner=agent))
+            except Exception as error:
+                blockers.append(f"RSI resume validation failed: {error}")
         role_configs = (
             agent.role_configs()
             if hasattr(agent, "role_configs")
@@ -156,6 +177,7 @@ async def check_job(config, *, root=ROOT, require_credentials=False):
                     bitfun_config=role_config,
                 )
                 roles[role] = {
+                    "context_policy": role_config.get("ai", {}).get("context_policy", {"mode": "native"}),
                     "model_endpoints": probe.network_allowlist().domains,
                     "default_models": role_config.get("ai", {}).get(
                         "default_models", {}
@@ -182,7 +204,7 @@ async def check_job(config, *, root=ROOT, require_credentials=False):
                 )
                 if task["has_steps"]:
                     blockers.append("Baseline work-budget adapter requires single-step tasks")
-                if limit is not None and agent.total_timeout_sec >= limit:
+                if agent.name() != "bitfun-rsi" and limit is not None and agent.total_timeout_sec >= limit:
                     blockers.append(
                         f"{task['task']}: baseline total_timeout_sec must be below Pier's agent work timeout"
                     )
@@ -214,6 +236,7 @@ async def check_job(config, *, root=ROOT, require_credentials=False):
         "binaries": binaries,
         "output": str(job_dir),
         "blockers": blockers,
+        **({"resume": resume} if resume is not None else {}),
     }
 
 
@@ -229,6 +252,8 @@ def main(argv=None):
     )
     parser.add_argument("--task", help="Run just this task from the configured dataset")
     parser.add_argument("--name", help="New output directory name")
+    parser.add_argument("--resume-from", type=Path,
+                        help="Resume a stopped RSI trial at a committed BRS wave in a new job")
     args = parser.parse_args(argv)
     os.chdir(ROOT)
     os.umask(0o077)
@@ -238,12 +263,18 @@ def main(argv=None):
     # 加载环境变量和配置文件
     if args.env_file.exists():
         load_dotenv(args.env_file, override=False)
-    config = load_job(
-        select_config(args.mode, args.config),
-        task=args.task,
-        name=args.name,
-        mode=args.mode,
-    )
+    if args.resume_from is not None:
+        if args.mode != "rsi" or not args.name or args.config is not None or args.task is not None:
+            parser.error("--resume-from requires --mode rsi and a new --name; "
+                         "--config/--task cannot override the saved experiment")
+        from benchmarks.deepswe.rsi_resume import load_resume_job
+        try:
+            config = load_resume_job(args.resume_from, args.name)
+        except Exception as error:
+            parser.exit(2, f"RSI resume validation failed: {error}\n")
+    else:
+        config = load_job(
+            select_config(args.mode, args.config), task=args.task, name=args.name, mode=args.mode)
 
     async def execute():
         report = await check_job(config, require_credentials=args.action == "run")

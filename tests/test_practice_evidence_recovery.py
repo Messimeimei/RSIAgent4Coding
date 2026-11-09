@@ -189,6 +189,23 @@ def test_evidence_budget_exhaustion_never_becomes_success(tmp_path,monkeypatch):
     assert calls==['actor','verify'] and not (ep/'verifier_report.md').exists()
 
 
+def test_native_adapter_usage_counts_real_rounds_and_excludes_transport_pause(tmp_path,monkeypatch):
+    ep,kw,calls,_=evidence_setup(tmp_path,monkeypatch,iter(['wrong']))
+    original = R.V._run_handoff_phase
+    def actor(**kwargs):
+        decision, history, result = original(**kwargs)
+        result.infra_pause_secs = 8.0
+        return decision, history, result
+    monkeypatch.setattr(R.V, '_run_handoff_phase', actor)
+    kw['hooks'].role_work_usage = lambda session: (17, 6.0)
+    out = R.run_practice_with_evidence(**kw)
+    assert out['terminal_outcome'] == 'FAIL'
+    record = json.loads((ep/'evidence_cycle_002.json').read_text())
+    assert record['verifier_iters_charged'] == 4 + 17
+    assert record['verifier_wall_secs_charged'] == 10
+    assert record['actor_wall_secs_charged'] == 20
+
+
 def test_verifier_transport_absence_never_triggers_an_actor_retry(tmp_path,monkeypatch):
     import core.verifier as verifier
     ep,kw,calls,_=evidence_setup(tmp_path,monkeypatch,iter([]))

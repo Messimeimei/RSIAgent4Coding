@@ -206,6 +206,33 @@ def test_parallel_failure_drains_and_closes_successful_sibling(tmp_path, monkeyp
     assert closed == ["curriculum", 2]
 
 
+def test_parking_cleanup_failure_aborts_siblings_and_records_original_error(tmp_path, monkeypatch):
+    from explore.practice_loop import PracticeHooks
+    from config.settings import Config
+    projects = tuple(wave.WaveProject(str(i), 'public instruction') for i in (1, 2))
+    decision = wave.WaveDecision('WAVE', 'rationale', projects, '{}')
+    monkeypatch.setattr(wave, '_author_wave', lambda **kw: (decision, []))
+    monkeypatch.setattr(wave, '_capture_wave_fixtures', lambda **kw: None)
+    monkeypatch.setattr(wave, '_push_canonical_memory', lambda *a: None)
+    aborted = []
+    def close():
+        raise RuntimeError('parked environment down failed')
+    def branch(**kw):
+        return SimpleNamespace(project_index=kw['project_index'],
+            desktop=SimpleNamespace(close=close), vm=object(),
+            project=kw['project'], terminal_outcome='PASS')
+    monkeypatch.setattr(wave, '_execute_branch_with_infra_retry', branch)
+    hooks = PracticeHooks(validate_corpus=lambda *a: None, audit_text=lambda *a, **k: [],
+        branch_failure=lambda error: aborted.append(str(error)))
+    result = wave.evolve_parallel_phase1(root=str(tmp_path), target_direction='public instruction',
+        actor_cfg=Config(), curriculum_cfg=Config(), memory_cfg=Config(), verifier_control_cfg=Config(),
+        corpus_path='unused', hooks=hooks, project_budget=2, max_parallel=2, park_verified_branches=True,
+        vm_factory=lambda: (SimpleNamespace(close=lambda: None), object()))
+    assert result.status == 'infra' and result.projects == 0
+    assert aborted == ['parked environment down failed']
+    assert 'parked environment down failed' in (tmp_path/'phase_exception.json').read_text()
+
+
 
 
 def test_boot_adapter_caches_only_one_allocation_and_extends_waits(monkeypatch):

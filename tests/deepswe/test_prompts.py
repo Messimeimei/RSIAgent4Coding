@@ -77,7 +77,8 @@ def test_coding_verifier_keeps_current_agentic_judgment_and_discrimination():
 
 @pytest.mark.parametrize("role", [0, 1])
 @pytest.mark.parametrize("calls", [0, 1])
-def test_full_role_message_survives_bitfun_cli_shell_transport(tmp_path, role, calls):
+@pytest.mark.asyncio
+async def test_full_role_message_survives_bitfun_cli_shell_transport(tmp_path, role, calls):
     instruction = 'Preserve literal `code`, $(text), "quotes", and\nnewlines.'
     prompt = (
         actor_prompt(instruction, 2, "a", feedback="repair", recovery="worklog")
@@ -86,11 +87,15 @@ def test_full_role_message_survives_bitfun_cli_shell_transport(tmp_path, role, c
     )
     session = BitfunSession(logs_dir=tmp_path, bitfun_config={"ai": {}})
     session.calls = calls
-    shell = shlex.split(session.command(prompt).split(" &\n")[0])[-1]
+    uploaded = []
+    async def upload_file(source, remote):
+        uploaded.append((source.read_bytes(), remote))
+    path = await session.upload_prompt(SimpleNamespace(upload_file=upload_file), prompt, 'prompt.txt')
+    shell = shlex.split(session.command(path).split(" &\n")[0])[-1]
     tokens = shlex.split(shell)
-    # The full message is one argument, not shell code or a discarded local
-    # variable, on both first invocation and --resume.
-    assert tokens[tokens.index("--") + 1] == prompt
+    assert tokens[tokens.index("<") + 1] == path
+    assert uploaded == [(prompt.encode('utf-8'), path)]
+    assert prompt not in shell
     assert ("--resume" if calls else "--session-id") in tokens
     assert (EPISTEMIC_CORE if role == 0 else VERIFIER_REQUIREMENT_EVIDENCE) in prompt
 

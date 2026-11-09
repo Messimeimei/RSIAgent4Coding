@@ -143,12 +143,12 @@ async def test_failed_command_does_not_put_secret_into_exception(agent):
     assert "test-secret-not-a-real-key" not in str(failure.value)
 
 
-def test_instruction_is_passed_intact_and_not_shell_interpreted(agent):
-    text = 'Task text with `touch BAD` and $(touch BAD) and "quotes"'
-    shell = agent._build_run_shell(text)
+def test_native_command_redirects_prompt_file(agent):
+    path = '/tmp/rsiagent-bitfun/native-prompt.txt'
+    shell = agent._build_run_shell(path)
     outer = shlex.split(shell.split(" &\n", 1)[0])
     inner = outer[-1]
-    assert shlex.quote(text) in inner
+    assert '< ' + shlex.quote(path) in inner
     assert "--output-patch" not in inner
     assert "--auto --agent agentic" in inner
 
@@ -175,7 +175,7 @@ async def test_cancel_stops_process_before_final_capture(agent):
     agent._capture_repo_final_state = final
     agent._capture_final_app_config = AsyncMock()
     with pytest.raises(asyncio.CancelledError):
-        await agent.run("task", SimpleNamespace(exec=kill), AgentContext())
+        await agent.run("task", SimpleNamespace(exec=kill, upload_file=AsyncMock()), AgentContext())
     assert actions.index("kill") < actions.index("snapshot") < actions.index("collect")
 
 

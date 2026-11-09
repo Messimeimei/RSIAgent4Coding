@@ -1,0 +1,8 @@
+# Reference practice evidence accounting; actual model transport is BitFun.
+model: bitfun:verifier
+max_iters: 2000
+wall_clock_secs: 86400
+practice_mode: true
+independent_verify: false
+agent_decided_stop: true
+max_resumes: 0

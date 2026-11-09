@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "implementation": "rsi-context-policy-v1",
+  "source_repository": "https://github.com/GCWing/OpenBitFun",
+  "source_commit": "ff73824bb2109d1a8fdc8e2e713795d2e9e0d8c5",
+  "source_archive_url": "https://codeload.github.com/GCWing/OpenBitFun/tar.gz/ff73824bb2109d1a8fdc8e2e713795d2e9e0d8c5",
+  "source_archive_sha256": "0063edcf269717880d86b85ecaf86cf78f493f21812388213217014b11d911bc",
+  "patch_sha256": "dd6aff6f8a8d9506df4a73f9236413a32d3084018794558b72da485861d38ef8",
+  "reference_commit": "4d7ef43770dda341fccd9a5743db92407687c615",
+  "reference_files": [
+    "core/loop.py",
+    "core/actor.py",
+    "config/roles/target.yaml",
+    "config/roles/actor.yaml",
+    "config/roles/verifier.yaml",
+    "config/roles/practice_verifier.yaml",
+    "config/roles/curriculum.yaml"
+  ],
+  "files": [
+    "src/apps/cli/src/main.rs",
+    "src/crates/assembly/core/src/agentic/core/message.rs",
+    "src/crates/assembly/core/src/agentic/execution/execution_engine.rs",
+    "src/crates/assembly/core/src/agentic/session/compression/mod.rs",
+    "src/crates/assembly/core/src/agentic/session/compression/work_log.rs",
+    "src/crates/assembly/core/src/agentic/session/compression/work_log_prompt.txt",
+    "src/crates/assembly/core/src/agentic/session/session_manager.rs",
+    "src/crates/assembly/core/src/service/config/types.rs",
+    "src/crates/execution/agent-runtime/src/context_policy.rs",
+    "src/crates/execution/agent-runtime/src/lib.rs",
+    "src/crates/execution/agent-runtime/src/session.rs"
+  ]
+}

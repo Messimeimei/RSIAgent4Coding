@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import hashlib
 import json
 import shlex
 import uuid
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -16,6 +16,7 @@ from pier.models.trial.paths import TrialPaths
 from pier.models.agent.network import NetworkAllowlist
 
 from .docker_environment import BitfunDockerEnvironment
+from .docker_lifecycle import cleanup_environment
 
 
 @dataclass(frozen=True)
@@ -205,13 +206,10 @@ async def review_environment(
     finally:
         # Keep the shared task image while the Actor still owns its container.
         # All removals are scoped to this unique review compose project.
+        primary = sys.exception()
         try:
-            await asyncio.wait_for(environment.prepare_logs_for_host(), timeout=20)
-            await asyncio.wait_for(
-                environment._run_docker_compose_command(
-                    ["down", "--rmi", "local", "--volumes", "--remove-orphans"]
-                ),
-                timeout=90,
-            )
-        finally:
-            environment._cleanup_resources_compose_file()
+            await cleanup_environment(environment)
+        except Exception as error:
+            if primary is None:
+                raise
+            primary.add_note(f"Review cleanup also failed: {error}")

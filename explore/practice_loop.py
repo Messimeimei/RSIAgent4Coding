@@ -742,15 +742,32 @@ def _run_learning_diagnosis(
         segment += 1
 
 
+def _require_hook_mapping(result: Any, hook_name: str) -> dict[str, Any]:
+    """Normalize lifecycle hook failures into an actionable infra error.
+
+    Keep malformed adapter results classified as infrastructure and identify
+    the hook, instead of allowing a later ``result.get`` to obscure the cause.
+    """
+    if not isinstance(result, dict):
+        preview = repr(result)
+        if len(preview) > 500:
+            preview = preview[:500] + "..."
+        raise PracticeInfrastructureError(
+            f"lifecycle hook {hook_name} returned {type(result).__name__}, "
+            f"expected dict: {preview}")
+    return result
+
+
 def _fresh_vm(hooks: "PracticeHooks", vm, target: str) -> None:
-    result = hooks.reset_vm(vm, target)
+    result = _require_hook_mapping(hooks.reset_vm(vm, target), "reset_vm")
     if not result.get("ok"):
         raise PracticeInfrastructureError(
             "fresh VM boundary failed: " + str(result.get("error", "unknown")))
 
 
 def _replay(hooks: "PracticeHooks", vm, snapshot_dir: str) -> None:
-    result = hooks.replay_project(vm, snapshot_dir)
+    result = _require_hook_mapping(
+        hooks.replay_project(vm, snapshot_dir), "replay_project")
     if not result.get("ok"):
         raise PracticeInfrastructureError(
             "project snapshot replay failed: "
@@ -759,7 +776,8 @@ def _replay(hooks: "PracticeHooks", vm, snapshot_dir: str) -> None:
 
 def _verify_candidate(hooks: "PracticeHooks", vm, snapshot_dir: str) -> None:
     """Fail closed if live candidate files differ from the Actor snapshot."""
-    result = hooks.verify_project(vm, snapshot_dir)
+    result = _require_hook_mapping(
+        hooks.verify_project(vm, snapshot_dir), "verify_project")
     if not result.get("ok"):
         raise PracticeInfrastructureError(
             "candidate snapshot integrity verification failed: "
@@ -964,8 +982,8 @@ def _push_actor_execution_evidence(
 
 def _capture_owned_tree(hooks: "PracticeHooks", vm, key: str,
                         host_dir: str, target: str) -> None:
-    result = hooks.capture_project(
-        vm, key, host_dir, guest_dirs=[PROJECT_ROOT_NAME])
+    result = _require_hook_mapping(hooks.capture_project(
+        vm, key, host_dir, guest_dirs=[PROJECT_ROOT_NAME]), "capture_project")
     if not result.get("ok"):
         raise PracticeInfrastructureError(
             "owned project root was absent, empty, or could not be captured")
@@ -1042,6 +1060,10 @@ class PracticeHooks:
     # Optional execution adapters. None preserves the released OSWorld runtime.
     verify_agentic: Callable[..., Any] | None = None
     actor_evidence_leads: Callable[..., str] | None = None
+    role_work_usage: Callable[..., tuple[int, float]] | None = None
+    # Coding jobs can cancel sibling native calls after an unrecoverable branch
+    # error; released VM callers retain their existing drain-all policy.
+    branch_failure: Callable[[Exception], None] | None = None
 
 
 def _resume_completed_phase1_boundary(

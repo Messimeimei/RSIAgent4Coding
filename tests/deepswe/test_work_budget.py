@@ -271,6 +271,52 @@ def test_fatal_request_errors_do_not_pause_or_loop(tmp_path, status):
     assert not relay.events.exists()
 
 
+def test_explicit_provider_max_tokens_limit_retries_same_request_once(tmp_path):
+    message = (
+        b"The parameter `max_tokens` specified in the request are not valid: "
+        b"integer above maximum value, expected a value <= 4096, but got 65536 instead."
+    )
+    rejected = HTTPError(
+        "http://model.invalid", 400, "bad request", {}, io.BytesIO(message)
+    )
+    relay = fake_relay(tmp_path, [rejected, response(b'{"choices":[{}]}')])
+    request = Request(
+        "http://model.invalid/v1/chat/completions",
+        data=b'{"model":"deepseek","max_tokens":65536,"messages":[]}',
+        headers={"Authorization": "Bearer test-key"},
+    )
+    status, _, data = relay.fetch("one", request, threading.Event())
+    with data:
+        assert status == 200
+        assert data.read() == b'{"choices":[{}]}'
+    assert relay.opener.open.call_count == 2
+    retried = relay.opener.open.call_args_list[1].args[0]
+    assert json.loads(retried.data)["max_tokens"] == 4096
+    assert json.loads(retried.data)["messages"] == []
+    records = [json.loads(line) for line in relay.events.read_text().splitlines()]
+    assert records[0]["event"] == "max_tokens_adapted"
+    assert records[0]["limit"] == 4096
+    assert "test-key" not in relay.events.read_text()
+
+
+def test_unrelated_bad_request_remains_fatal(tmp_path):
+    rejected = HTTPError(
+        "http://model.invalid", 400, "bad request", {},
+        io.BytesIO(b"invalid tool schema"),
+    )
+    relay = fake_relay(tmp_path, [rejected])
+    request = Request(
+        "http://model.invalid/v1/chat/completions",
+        data=b'{"max_tokens":65536}',
+    )
+    status, _, data = relay.fetch("one", request, threading.Event())
+    with data:
+        assert status == 400
+        assert data.read() == b"invalid tool schema"
+    assert relay.opener.open.call_count == 1
+    assert not relay.events.exists()
+
+
 def test_sse_done_ends_request_without_waiting_for_keep_alive_eof(tmp_path):
     body = b'data: {"choices":[{"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
 
@@ -300,6 +346,12 @@ def test_sse_done_ends_request_without_waiting_for_keep_alive_eof(tmp_path):
         (b'{"error":{"code":503}}', "application/json", 503),
         (b'{"error":{"code":400}}', "application/json", 400),
         (b'{"choices":[]}', "application/json", 503),
+        (b'{"choices":null}', "application/json", 503),
+        (b'{"choices":[null]}', "application/json", 503),
+        (b'null', "application/json", 503),
+        (b'data: {"choices":null}\n\n', "text/event-stream", 503),
+        (b'data: {"choices":[null]}\n\n', "text/event-stream", 503),
+        (b'data: {"choices":42}\n\n', "text/event-stream", 503),
         (b'data: {"error":{"code":429}}\n\n', "text/event-stream", 429),
         (
             b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
@@ -395,4 +447,20 @@ async def test_session_bootstrap_preserves_identity_and_finishes_transport_clock
     assert "transport_pid=$!" in commands[1]
     assert "trap " in commands[1]
     assert not budget.paths
-    assert env.upload_file.await_count == 2
+    assert env.upload_file.await_count == 4  # one prompt file and relay per call
+
+
+@pytest.mark.asyncio
+async def test_native_execution_failure_is_diagnostic_and_redacts_credentials(tmp_path, model, monkeypatch):
+    from benchmarks.deepswe.bitfun_agent import credential_variables
+    session = BitfunSession(logs_dir=tmp_path, bitfun_config=model)
+    for key in credential_variables(model):
+        monkeypatch.setenv(key, 'secret-test-key')
+    async def broken(*args, **kwargs):
+        raise RuntimeError('failure detail: Bearer secret-test-key')
+    session.exec_as_agent = broken
+    outcome = await session.execute(SimpleNamespace(upload_file=AsyncMock()), 'test', 5, role='actor', handoff_id='one')
+    assert outcome.status == 'execution_error'
+    assert 'failure detail' in outcome.error and 'secret-test-key' not in outcome.error
+    saved = json.loads(next(tmp_path.glob('checkpoint-*.json')).read_text())
+    assert saved['error'] == outcome.error

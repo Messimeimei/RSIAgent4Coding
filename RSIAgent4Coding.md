@@ -79,6 +79,24 @@ retry:
 
 ## 四、RSIAgent baseline 适配 Coding 任务
 
+Pier / DeepSWE 评测框架
+          │
+          ├─ Baseline：baseline.py
+          │     └─ 编码 → 候选快照 → 独立审查 → 补证据 / 修复
+          │
+          └─ RSI：rsi.py
+                ├─ 第一阶段：并行练习，积累记忆
+                ├─ 第二阶段：目标训练、学习与课程练习
+                └─ 第三阶段：冻结记忆 + Baseline 最终执行
+
+共同执行底座：
+  BitFun 接入与会话 + 提示词/交接协议 + 时间预算 + Docker/模型通信
+
+RSI 额外依赖：
+  学习运行时 + 检查点 + 完整性检查
+
+如果目的是读懂代码，建议从 baseline.py → session.py → contracts.py / review_environment.py → rsi.py → rsi_runtime.py 开始；上游 _vendor/bitfun_cli.py 可以在需要追踪底层执行或轨迹统计时再读。
+
 第一个需要考虑的适配问题是被评测对象 bitfun 的适配，deepswe 的官方流程如下：
 
 | 组件 | 作用 |
@@ -167,6 +185,37 @@ checks 字段里面的 probe 就是需要进行自检查的内容，这个是进
 
 ### 第三步：在第二步的基础上引入 RSIAgent 的概念。
 
-这一步需要考虑的是怎么把 Curriculum 的概念引入，这个需要一个单独的 bitfun 会话负责完整，并生成对应的训练材料；然后需要修改之前 Actor 做题的逻辑，也是单独开一个 bitfun 会话，在会话里面完成连续的作答并最后给出交付的材料。这里需要修改的就是 Actor 相关的 prompt，把之前适配桌面操作相关的修改掉，包括允许模型做的操作，和返回格式的要求等，都需要重新修改。最后是 Verifier 的 prompt 也需要修改，包括指定返回的判断类型，需要告诉 bitfun 返回 PASS 还是 FAIL 还是 UNVERIFIER，除此之外，Verifier 的回滚问题也需要适配，在 Verifier 进行检查之前需要保存 Actor 的结果，同时 Verifier 与 Actor 之间的返工交互也要做好，如果 Verifier 觉得需要继续做的话，怎么把 Verifier 的结果给到 Actor 再让 Actor 接着干活。
+这一步需要考虑的是怎么把 Curriculum 的概念引入，这个需要一个单独的 bitfun 会话负责完整，并生成对应的训练材料；然后需要修改之前 Actor 做题的逻辑，也是单独开一个 bitfun 会话，在会话里面完成连续的作答并最后给出交付的材料。还有需要考虑的就是，最后得到了冻结的记忆，应该怎么保存和加载。包括 BRS 和 DRS 两个阶段得到的记忆怎么保存，最后怎么在 phase2 开头和最后的 phase3 阶段加载给 bitfun 让他读取记忆完成任务。
 
-- 第四步：还有需要考虑的就是，最后得到了冻结的记忆，应该怎么保存和加载。包括 BRS 和 DRS 两个阶段得到的记忆怎么保存，最后怎么在 phase2 开头和最后的 phase3 阶段加载给 bitfun 让他读取记忆完成任务。
+  A[Curriculum 生成练习] --> B[新环境：Actor 完成练习]
+  B --> C[保存候选文件与 Actor 会话]
+  C --> D[新环境：Verifier 独立检查]
+  D --> E[确认检查没有改变候选]
+  E --> F[整批分支完成]
+  F --> G[恢复同一个 Actor，提炼并合并记忆]
+  G --> H[后续学习与正式评测]
+
+这一步在实际修改过程中遇到了如下问题：
+
+1. 原生会话归档失败。在原本 RISAgent 的实现中，是通过保存会话历史，来进行不同角色如 Curriculum，每个任务的 actor 和 verifier 的会话保存。而 bitfun 不是简单的模型 API 调用，他有自己的原生的会话目录，因此不能只保留文本层面的对话历史，要把整个会话目录保存，才能实现后续的会话连续性。
+
+2. verifier 检查要求不能破坏 actor 的原始内容，但测试自动生成缓存导致完整性检查错误。原本的 RSIAgent 中的 verifier 在 deepswe 的题目检查中，运行了 pytest，生成了 pyc，pytest_cache/* 等内容，而原始的文件没有这些，当 verifier 尝试删除这些缓存，又因为不得修改候选为由拒绝操作，导致完整性被破坏。
+
+原本的是提供了只读文件系统隔离，且可以进行回滚，而 deepswe 的 rsi 虽然用独立的 docker 隔离了原来的 actor 环境，但没有处理运行测试的隐式写入。
+
+3. Hypothesis 这个属性测试工具也会生成辅助状态，和第二点一点但是没有被第二点修复，漏了这个的控制。
+
+4. Git 查询刷新了索引缓存，也被当成候选内容的变化。因为 deepswe 这个任务需要用到 git 检查，但是之前的版本只处理了暂存内容，没有考虑元数据也会变化。
+
+5. bigfun 新增了“工具调用已返回，但底层进程继续运行”的异步状态，而原本的是返回统一 Trace，里面有输出、退出码、超时和基础设施状态。框架需要这些状态来区分有效执行、失败、超时与没有进展，但是 bitfun 返回工具调用后，底层进程还在继续，沿用原来的处理，就导致报错。
+
+6. 为子任务创建环境的时候 Docker 返回网络冲突错误。原本 RSIAgent 要求每个子任务创建独立环境，deepswe 是新建 Docker compose，由 pier 创建受控的网络，容器隔离因此额外依赖 Docker 网络资源分配。而有一个子任务在创建环境的时候，网络分配与已有网络重叠了。
+
+7. 失败发生在启动第二轮 Curriculum：prompt 经命令行嵌套转义后过长，报 [Errno 7] Argument list too long: 'docker'。 bitfun 把 prompt 直接通过命令行传入的方式，在连续多轮课程出题的时候，容易过长导致报错
+
+## 五、RSIAgent 适配流程详解
+
+
+## 六、RSIAgent 缺点
+
+1. DRS 阶段持续太长，无限探索。
