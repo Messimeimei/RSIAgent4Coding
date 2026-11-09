@@ -22,7 +22,6 @@ id_rsa*
 
 # Python and editor state
 .venv/
-.runtime/
 .venv-*/
 venv/
 __pycache__/
@@ -40,3 +39,20 @@ dist/
 
 # 忽略宿主机的备份配置
 runtime.json.local-original
+
+# 运行产物 / 备份
+*.pid
+*.bak-*
+
+# 远程运行时代码/配置（.runtime/deepswe 下）随仓库走；
+# 密钥、依赖、二进制与运行产物一律排除。
+.runtime/*
+!.runtime/deepswe/
+.runtime/deepswe/*
+!.runtime/deepswe/phase3_eval/
+!.runtime/deepswe/launchers/
+.runtime/deepswe/phase3_eval/*
+!.runtime/deepswe/phase3_eval/*.py
+!.runtime/deepswe/phase3_eval/*.yaml
+.runtime/deepswe/launchers/*
+!.runtime/deepswe/launchers/*.sh
