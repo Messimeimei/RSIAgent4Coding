@@ -41,7 +41,8 @@ def stopped(tmp_path):
     trial = tmp_path / 'jobs/old/trial'
     root = trial / 'rsi'
     model = {'ai': {'models': [{'base_url': 'http://model.invalid/v1', 'api_key': '${TEST_KEY}'}]}}
-    owner = BitfunRSI(logs_dir=tmp_path / 'new/agent', bitfun_config=model)
+    owner = BitfunRSI(logs_dir=tmp_path / 'new/agent', bitfun_config=model,
+                      total_timeout_sec=10200)
     task = tmp_path / 'tasks/example'
     task.mkdir(parents=True)
     (task / 'task.toml').write_text('')
@@ -102,7 +103,8 @@ def stopped(tmp_path):
         'error': "OSError: [Errno 7] Argument list too long: 'docker'"})
     from pier.models.job.config import JobConfig
     job = JobConfig.model_validate({'job_name': 'old', 'jobs_dir': str(trial.parent.parent),
-        'agents': [{'import_path': 'benchmarks.deepswe.rsi:BitfunRSI', 'kwargs': {'bitfun_config': model}}],
+        'agents': [{'import_path': 'benchmarks.deepswe.rsi:BitfunRSI',
+                    'kwargs': {'bitfun_config': model, 'total_timeout_sec': 10200}}],
         'datasets': [{'path': str(task.parent), 'task_names': ['example']}]})
     atomic_json(trial.parent / 'config.json', job.model_dump(mode='json'))
     return SimpleNamespace(trial=trial, root=root, lineage=lineage, owner=owner,

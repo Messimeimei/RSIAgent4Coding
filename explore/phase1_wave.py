@@ -2,10 +2,10 @@
 
 The Curriculum Agent chooses each wave's width and projects.  Every branch reads
 the same immutable pre-wave memory snapshot and runs in an isolated fresh VM.
-Only after every branch has a terminal Verifier verdict are the *same* branch
-Actor contexts resumed, one at a time, to reconcile their experience into the
-single flat canonical memory bank.  The serialized commit boundary prevents
-sibling observation and lost-update races without imposing a memory schema.
+After branches settle, verified branch Actor contexts reconcile their experience
+into one canonical memory bank. Strict callers require every branch to finish;
+coding callers may quarantine exceptions and advance with committed PASS/FAIL
+experiences only. Staged updates keep failed learning outside canonical memory.
 """
 
 from __future__ import annotations
@@ -66,6 +66,9 @@ from explore.practice_loop import (
     _verify_actor_execution_evidence,
     _verify_candidate,
 )
+
+
+from explore.project_isolation import isolate_artifacts, require_memory
 
 
 WAVE_ROOT = "/home/user/evolution_wave"
@@ -616,6 +619,7 @@ def evolve_parallel_phase1(
         target_query_conditioned: bool = False,
         resume_completed_boundary: bool = False,
         park_verified_branches: bool = False,
+        isolate_failed_projects: bool = False,
         boundary_validator=None) -> PracticeResult:
     """Run persistent-Curriculum parallel waves until Agent saturation.
 
@@ -651,6 +655,11 @@ def evolve_parallel_phase1(
     wave_index = 0
     curriculum_history: list[dict[str, Any]] = []
     previous_wave_outcomes = ""
+    isolated = []
+    committed_projects = 0
+    trusted_memory = _read_memory_tree(str(memory_dir))
+    transition_safe = False
+    authoring_source = None
     if resume_completed_boundary:
         from explore.phase1_boundary_recovery import validate_boundary, archive_pending
         plan = (boundary_validator or validate_boundary)(
@@ -690,6 +699,9 @@ def evolve_parallel_phase1(
             "project_budget": project_budget,
             "max_parallel": max_parallel,
             "checkpoint_projects": list(checkpoint_projects),
+            "isolated_projects": isolated,
+            "committed_projects": committed_projects,
+            "isolate_failed_projects": isolate_failed_projects,
             "target_sha256": hashlib.sha256(
                 target_direction.encode("utf-8")).hexdigest(),
             "memory_manifest": _manifest(
@@ -702,6 +714,25 @@ def evolve_parallel_phase1(
             terminal_text=terminal_text, last_project=project_index)
 
     active_branches: list[_BranchRuntime] = []
+
+    def isolate(index, episode, error, stage):
+        nonlocal transition_safe
+        try:
+            hooks.validate_corpus(corpus_path)
+            require_memory(memory_dir, trusted_memory)
+            receipt = isolate_artifacts(lineage, episode, error, stage=stage,
+                trusted_memory=trusted_memory, project_index=index,
+                error_details=hooks.format_isolation_error("".join(traceback.format_exception(error)))
+                if hooks.format_isolation_error else None)
+        except Exception as global_error:
+            transition_safe = False
+            if hooks.branch_failure is not None:
+                hooks.branch_failure(global_error)
+            raise
+        isolated.append(receipt)
+        emit("PHASE1_PROJECT_ISOLATED", status="isolated", project=index,
+             stage=stage, error_type=type(error).__name__, memory_promoted=False)
+
     try:
         if not target_direction.strip():
             raise PracticeInfrastructureError("target direction is empty")
@@ -711,6 +742,9 @@ def evolve_parallel_phase1(
             checkpoint(0)
         else:
             emit("PHASE1_WAVE_BOUNDARY_RESUMED", wave=wave_index, projects=project_index)
+        trusted_memory = _read_memory_tree(str(memory_dir))
+        committed_projects = project_index
+        transition_safe = True
         while True:
             if project_budget is not None and project_index >= project_budget:
                 return finish(
@@ -721,6 +755,7 @@ def evolve_parallel_phase1(
             wave_dir = waves_dir / f"wave_{wave_index:03d}"
             curriculum_sink = lineage / "curriculum" / \
                 f"wave_{wave_index:03d}"
+            authoring_source = curriculum_sink
             curriculum_desktop, curriculum_vm = vm_factory()
             try:
                 _push_canonical_memory(hooks, curriculum_vm, str(memory_dir))
@@ -745,10 +780,20 @@ def evolve_parallel_phase1(
                     (project_index + offset, project,
                      episodes_dir / f"ep{project_index + offset:03d}")
                     for offset, project in enumerate(decision.projects, 1))
-                _capture_wave_fixtures(
-                    hooks=hooks, vm=curriculum_vm, decision=decision,
-                    assignments=assignments,
-                    target_direction=target_direction)
+                fixture_failures = set()
+                if isolate_failed_projects:
+                    for index, project, episode in assignments:
+                        try:
+                            _capture_wave_fixtures(hooks=hooks, vm=curriculum_vm, decision=decision,
+                                assignments=((index, project, episode),), target_direction=target_direction)
+                        except Exception as error:
+                            isolate(index, episode, error, "fixtures")
+                            fixture_failures.add(index)
+                else:
+                    _capture_wave_fixtures(
+                        hooks=hooks, vm=curriculum_vm, decision=decision,
+                        assignments=assignments,
+                        target_direction=target_direction)
             finally:
                 primary = sys.exception()
                 try:
@@ -758,6 +803,7 @@ def evolve_parallel_phase1(
                         raise
                     primary.add_note(f"Curriculum cleanup also failed: {cleanup_error}")
 
+            authoring_source = None
             emit(
                 "PHASE1_WAVE_STARTED", wave=wave_index,
                 projects=len(assignments),
@@ -778,7 +824,7 @@ def evolve_parallel_phase1(
                         verifier_control_cfg=copy.deepcopy(
                             verifier_control_cfg),
                         target_direction=target_direction): index
-                    for index, project, episode_dir in assignments
+                    for index, project, episode_dir in assignments if index not in fixture_failures
                 }
                 for future in as_completed(futures):
                     if future.cancelled():
@@ -802,7 +848,14 @@ def evolve_parallel_phase1(
                             error_type=type(exc).__name__, error=str(exc),
                             classification=("boundary" if isinstance(
                                 exc, PracticeBoundaryError) else "infra"))
-                        if len(branch_errors) == 1 and hooks.branch_failure is not None:
+                        if isolate_failed_projects:
+                            index = futures[future]
+                            failed = completed.pop(index, None)
+                            if failed in active_branches:
+                                active_branches.remove(failed)
+                            isolate(index, episodes_dir / f"ep{index:03d}", exc,
+                                    getattr(exc, "rsi_branch_stage", "execute_or_cleanup"))
+                        elif len(branch_errors) == 1 and hooks.branch_failure is not None:
                             hooks.branch_failure(exc)
                             for pending_future in futures:
                                 pending_future.cancel()
@@ -813,26 +866,59 @@ def evolve_parallel_phase1(
                         project_id=branch.project.project_id,
                         terminal_outcome=branch.terminal_outcome)
 
-            # Drain every future so successful siblings retain an owned handle
-            # for cleanup even when another branch fails. Never commit a partial
-            # wave merely because the failing future happened to return first.
-            if branch_errors:
+            # Every sibling settles before memory consolidation. Strict callers
+            # abort here; opt-in callers commit independently verified branches.
+            if branch_errors and not isolate_failed_projects:
                 boundary = next((e for e in branch_errors
                                  if isinstance(e, PracticeBoundaryError)), None)
                 raise boundary or branch_errors[0]
 
             rendered_outcomes: list[str] = []
             for index, _project, _episode_dir in assignments:
+                if index not in completed:
+                    continue
                 branch = completed[index]
-                if park_verified_branches:
-                    branch.desktop, branch.vm = vm_factory()
-                    _replay(hooks, branch.vm,
-                            str(branch.episode_dir / "candidates/cycle_001"))
-                memory_record = _commit_branch_memory(
-                    branch=branch, hooks=hooks, memory_cfg=memory_cfg,
-                    canonical_memory_dir=memory_dir,
-                    journal_dir=journal_dir, corpus_path=corpus_path,
-                    target_direction=target_direction)
+                if isolate_failed_projects:
+                    staging = branch.episode_dir / "staged_memory"
+                    hooks.install_memory(str(staging), trusted_memory)
+                else:
+                    staging = memory_dir
+                try:
+                    if park_verified_branches:
+                        branch.desktop, branch.vm = vm_factory()
+                        _replay(hooks, branch.vm,
+                                str(branch.episode_dir / "candidates/cycle_001"))
+                    memory_record = _commit_branch_memory(
+                        branch=branch, hooks=hooks, memory_cfg=memory_cfg,
+                        canonical_memory_dir=staging,
+                        journal_dir=branch.episode_dir / "staged_journal" if isolate_failed_projects else journal_dir,
+                        corpus_path=corpus_path, target_direction=target_direction)
+                    if isolate_failed_projects and branch.desktop is not None:
+                        branch.desktop.close()
+                        branch.desktop = None
+                        branch.vm = None
+                except Exception as error:
+                    if not isolate_failed_projects:
+                        raise
+                    if branch.desktop is not None:
+                        try:
+                            branch.desktop.close()
+                        except Exception:
+                            pass
+                    active_branches.remove(branch)
+                    isolate(index, branch.episode_dir, error, "memory_learning")
+                    continue
+                # Canonical storage failures remain fatal: only staged role work is isolatable.
+                transition_safe = False
+                if isolate_failed_projects:
+                    hooks.validate_corpus(corpus_path)
+                    require_memory(memory_dir, trusted_memory)
+                    accepted = _read_memory_tree(str(staging))
+                    if memory_record["before"] != _manifest(trusted_memory) or memory_record["after"] != _manifest(accepted):
+                        raise PracticeInfrastructureError("Staged learning memory manifest mismatch")
+                    hooks.journal_memory(str(journal_dir), index, accepted,
+                        {"kind": "phase1-parallel-terminal-memory", "terminal_outcome": branch.terminal_outcome})
+                    hooks.install_memory(str(memory_dir), accepted)
                 record = {
                     "schema_version": 2,
                     "wave_index": wave_index,
@@ -857,14 +943,27 @@ def evolve_parallel_phase1(
                 rendered_outcomes.append(rendered)
                 project_index = index
                 checkpoint(project_index)
-                branch.desktop.close()
+                if branch.desktop is not None:
+                    branch.desktop.close()
                 active_branches.remove(branch)
+                trusted_memory = _read_memory_tree(str(memory_dir))
+                committed_projects += 1
+                transition_safe = True
                 emit(
                     "PHASE1_BRANCH_MEMORY_COMMITTED", status="completed",
                     wave=wave_index, project=project_index,
                     project_id=branch.project.project_id,
                     terminal_outcome=branch.terminal_outcome,
                     memory_changes=memory_record["changes"])
+
+            if isolated:
+                require_memory(memory_dir, trusted_memory)
+                hooks.validate_corpus(corpus_path)
+                project_index = assignments[-1][0]
+                _atomic_text(wave_dir / "accepted_outcomes.md", "\n\n".join(rendered_outcomes))
+                emit("PHASE1_PARTIAL_COMPLETED", status="partial", wave=wave_index,
+                     committed_projects=committed_projects, isolated_projects=len(isolated))
+                return finish("partial", "Isolated failed projects; advancing with committed memory only")
 
             previous_wave_outcomes = (
                 f"WAVE {wave_index} CURRICULUM RATIONALE:\n"
@@ -891,8 +990,14 @@ def evolve_parallel_phase1(
     except KeyboardInterrupt:
         return finish("infra", "KeyboardInterrupt: external interruption")
     except PracticeBoundaryError as exc:
+        if isolate_failed_projects and transition_safe and authoring_source is not None:
+            isolate(None, authoring_source, exc, "curriculum")
+            return finish("partial", "Isolated failed Curriculum; advancing with prior committed memory")
         return finish("quarantined", str(exc))
     except Exception as exc:  # noqa: BLE001 - persist inspectable infra state
+        if isolate_failed_projects and transition_safe and authoring_source is not None:
+            isolate(None, authoring_source, exc, "curriculum")
+            return finish("partial", "Isolated failed Curriculum; advancing with prior committed memory")
         _atomic_json(lineage / 'phase_exception.json', {
             'error_type': type(exc).__name__, 'error': str(exc),
             'traceback': traceback.format_exc(), 'wave': wave_index,

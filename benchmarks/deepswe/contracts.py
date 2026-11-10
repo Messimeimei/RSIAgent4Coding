@@ -27,6 +27,38 @@ class CompletionCheck(BaseModel):
     probe: str = Field(min_length=1)
 
 
+def read_role_completion(path, handoff_id, *, require_checks=False):
+    """Validate RSI completion without including submitted content in diagnostics."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+        raise HandoffError("Completion must be a regular JSON file below 2 MiB")
+    try:
+        value = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise HandoffError(f"Invalid JSON at line {error.lineno}, column {error.colno}") from error
+    except (OSError, UnicodeError) as error:
+        raise HandoffError("Completion must be readable UTF-8") from error
+    if not isinstance(value, dict):
+        raise HandoffError("Completion must be a JSON object")
+    if set(value) - {"kind", "handoff_id", "final", "checks"}:
+        raise HandoffError("Only kind, handoff_id, final and optional checks are allowed; put other results in the charter's files")
+    if value.get("kind") != "rsi_done":
+        raise HandoffError('kind must equal "rsi_done"')
+    if value.get("handoff_id") != handoff_id:
+        raise HandoffError("handoff_id must match the current invocation, not an earlier attempt")
+    if value.get("final") is not True:
+        raise HandoffError("final must be the JSON boolean true")
+    if not isinstance(value.get("checks", []), list):
+        raise HandoffError("checks must be an array of desc/probe objects")
+    try:
+        checks = [CompletionCheck.model_validate(item) for item in value.get("checks", [])]
+    except ValueError as error:
+        raise HandoffError("Each check must contain only nonempty desc and probe strings") from error
+    if require_checks and not checks:
+        raise HandoffError("This evidence response requires at least one reproducible check")
+    return value, checks
+
+
 class ActorHandoff(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["actor_done"]

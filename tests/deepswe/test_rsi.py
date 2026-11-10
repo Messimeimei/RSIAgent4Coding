@@ -44,7 +44,7 @@ def test_mode_keeps_baseline_and_native_independent():
         assert job.agents[0].import_path.endswith(":" + agent)
     job = load_job(select_config("rsi"), mode="rsi")
     cfg = job.agents[0].kwargs
-    assert cfg["parallel"] == 2 and cfg["brs_project_budget"] == 8
+    assert cfg["parallel"] == 1 and cfg["brs_project_budget"] == 8
     assert cfg["verifier_bitfun_config"] == cfg["curriculum_bitfun_config"]
 
 
@@ -257,7 +257,8 @@ async def test_frozen_phase3_uses_pristine_pier_container_and_no_training_candid
 
 
 @pytest.mark.asyncio
-async def test_native_session_continues_across_segment_and_records_only_done_probe_leads(tmp_path):
+@pytest.mark.parametrize("first_status", ["segment_exhausted", "invalid_handoff"])
+async def test_native_session_continues_across_segment_and_records_only_done_probe_leads(tmp_path, first_status):
     class Environment:
         def __init__(self):
             self.trial_paths = SimpleNamespace(agent_dir=tmp_path / "env/agent")
@@ -286,7 +287,11 @@ async def test_native_session_continues_across_segment_and_records_only_done_pro
             self.calls += 1
             await env.exec("native command")
             if self.calls == 1:
-                return SessionOutcome("segment_exhausted", metrics={"model_calls": 200, "completed_tools": 3})
+                return SessionOutcome(first_status, metrics={"model_calls": 200, "completed_tools": 3},
+                                      handoff_error="final must be the JSON boolean true" if first_status == "invalid_handoff" else None)
+            if first_status == "invalid_handoff":
+                assert "final must be the JSON boolean true" in prompt
+                assert "current handoff_id" in prompt
             path = self.logs_dir / "handoffs" / (kwargs["handoff_id"] + ".json")
             path.parent.mkdir(exist_ok=True)
             path.write_text(json.dumps({"kind": "rsi_done", "handoff_id": kwargs["handoff_id"],
@@ -304,6 +309,8 @@ async def test_native_session_continues_across_segment_and_records_only_done_pro
     result, session = await runtime.execute(SimpleNamespace(environment=environment),
         "independent-channel probes among your checks", "actor", tmp_path / "sink")
     assert result.iters == 203 and session is native and native.calls == 2
+    if first_status == "invalid_handoff":
+        assert json.loads((tmp_path / "sink/outcome-001.json").read_text())["handoff_error"] == "final must be the JSON boolean true"
     history = runtime.adopt(native)
     leads = runtime.evidence_leads(history, "target", Config())
     assert "python3 /tmp/probe.py" in leads and "native command" not in leads

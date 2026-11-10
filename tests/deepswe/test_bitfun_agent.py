@@ -25,7 +25,7 @@ from pier.environments.agent_setup import squid_bootstrap_command
 
 @pytest.fixture
 def config():
-    value = yaml.safe_load((ROOT / "config/deepswe/dateutil-bitfun.yaml").read_text())
+    value = yaml.safe_load((ROOT / "config/deepswe/native.yaml").read_text())
     # Test credentials are independent of the user's configured variable name.
     value["agents"][0]["kwargs"]["bitfun_config"]["ai"]["models"][0]["api_key"] = (
         "${DEEPSWE_API_KEY}"

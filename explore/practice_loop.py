@@ -1064,6 +1064,8 @@ class PracticeHooks:
     # Coding jobs can cancel sibling native calls after an unrecoverable branch
     # error; released VM callers retain their existing drain-all policy.
     branch_failure: Callable[[Exception], None] | None = None
+    # Optional host-only redaction for exceptional-project quarantine receipts.
+    format_isolation_error: Callable[[str], str] | None = None
 
 
 def _resume_completed_phase1_boundary(

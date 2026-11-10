@@ -142,6 +142,8 @@ def inspect_resume(trial, *, owner=None, instruction=None):
     require(instruction is None or instruction == task.instruction, "target instruction changed")
     protocol = read(root / "protocol.json")
     if owner is not None:
+        require(protocol.get("isolate_failed_projects", False) == owner.isolate_failed_projects,
+                "failed-project isolation policy differs from source run")
         expected = {"parallel": owner.parallel, "brs_project_budget": owner.brs_project_budget,
             "phase3_work_sec": owner.total_timeout_sec, "learning_role_work_sec": owner.learning_timeout_sec,
             "training_target_work_sec": owner.target_learning_timeout_sec, "roles": owner.role_configs()}

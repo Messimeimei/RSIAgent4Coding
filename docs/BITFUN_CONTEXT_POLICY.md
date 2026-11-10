@@ -58,7 +58,7 @@ python3 tools/build_bitfun_context_policy.py \
 
 ```bash
 .runtime/deepswe/venv/bin/python tools/configure_bitfun_context_policy.py \
-  --base config/deepswe/baseline-bitfun.yaml \
+  --base config/deepswe/baseline.yaml \
   --output /tmp/baseline-paper-context.yaml \
   --model-window 'DeepSeek-V4.1-Flash-1017=已确认的整数token数'
 ```

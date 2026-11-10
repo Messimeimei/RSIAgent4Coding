@@ -40,7 +40,7 @@ class BitfunBaseline(BitfunCli):
         self,
         *args,
         verifier_bitfun_config=None,
-        total_timeout_sec=10200,
+        total_timeout_sec=18000,
         report_recovery_attempts=2,
         command_timeout_sec=600,
         stall_recovery=True,
@@ -348,6 +348,7 @@ class BitfunBaseline(BitfunCli):
                     )
                     recovery = (
                         "Your preceding invocation did not publish a valid terminal report. "
+                        f"Validation detail: {getattr(outcome, 'handoff_error', None) or outcome.status}. "
                         "This is a transport/protocol recovery, NOT an UNVERIFIED verdict. "
                         "Continue the same investigation; use your saved tool observations. "
                         "Stop repeating unchanged actions. Publish the report at the NEW path. "
@@ -713,6 +714,7 @@ class BitfunBaseline(BitfunCli):
                             )
                         feedback = (
                             "No valid Actor terminal handoff was received. Continue this same session; "
+                            f"validation detail: {getattr(outcome, 'handoff_error', None) or outcome.status}. "
                             "preserve the solution, include executed/falsifiable probes, and publish the "
                             "required JSON at the new handoff path. Previous pending feedback:\n"
                             + (feedback or "None")

@@ -26,6 +26,7 @@ class SessionOutcome:
     last_action: dict = None
     last_result: str = ""
     error: str | None = None
+    handoff_error: str | None = None
 
 
 class BitfunSession(BitfunCli):
@@ -185,10 +186,12 @@ class BitfunSession(BitfunCli):
                             if terminal_reader is not None
                             else read_handoff(handoff_path, role, handoff_id, candidate_id)
                         )
-                    except HandoffError:
+                    except HandoffError as handoff_error:
                         report = None
+                        handoff_failure = self.failure_details(handoff_error, journal)
 
                     if report is not None:
+                        handoff_failure = None
                         status = "handoff"
                         break
 
@@ -234,8 +237,9 @@ class BitfunSession(BitfunCli):
                             )
                         except HandoffError as handoff_error:
                             report = None
-                            handoff_failure = str(handoff_error)
+                            handoff_failure = self.failure_details(handoff_error, journal)
                         if report is not None:
+                            handoff_failure = None
                             status = "handoff"
                         else:
                             status = (
@@ -305,6 +309,7 @@ class BitfunSession(BitfunCli):
                 journal.last_action,
                 journal.last_result,
                 error,
+                handoff_failure,
             )
         if unsettled:
             raise RoleInfrastructureError(

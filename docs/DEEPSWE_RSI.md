@@ -2,8 +2,8 @@
 
 `run_deepswe.py --mode rsi` adds BRS, DRS and frozen-memory evaluation. Native
 and baseline keep their own entry points/configurations. Default RSI configuration
-is `config/deepswe/rsi-bitfun.yaml`: DeepSeek-V4.1-Flash-1017 Actor, separate
-Qwen3.8-Flash Verifier and Curriculum sessions, `parallel: 2`.
+is `config/deepswe/rsi.yaml`: DeepSeek-V4.1-Flash-1017 Actor, separate
+Qwen3.8-Flash Verifier and Curriculum sessions, `parallel: 1`.
 
 ## Reference mapping
 
@@ -18,11 +18,48 @@ Qwen3.8-Flash Verifier and Curriculum sessions, `parallel: 2`.
 | Phase 3 | Existing `BitfunBaseline.run`, via `MemoryBaseline(training=False)` | Untouched original Pier target container, fresh role sessions, frozen memory inventory for Actor retrieval. FAIL repairs as in baseline. Official Pier grading runs afterward. |
 
 `parallel` is scheduling capacity, not prescribed wave width. Curriculum may
-publish more than two projects; the scheduler runs at most two practice branches
+publish more projects; the default scheduler runs at most one practice branch
 at once. BRS retains the reference 8-project safety boundary **between complete
 waves**; a wave may cross 8. It is not a convergence rule. Checkpoints are saved
 at projects 0, 4 and 8. BRS SATURATED or complete-wave budget exhaustion admits DRS;
 BRS STALLED/infrastructure/quarantine does not silently become saturation.
+The coding template enables `isolate_failed_projects: true`: exceptional
+subtasks can instead produce an explicit `partial` stage transition, as below.
+
+## Isolated Subtasks and Partial Training
+
+Normal grounded PASS and FAIL remain learning evidence. An infrastructure,
+handoff, integrity or boundary exception is never converted to either verdict.
+With `isolate_failed_projects: true`, its host artifacts move under the stage's
+`quarantine/` tree with an `isolation.json` receipt, no terminal verdict, and
+`memory_promoted: false`. Raw failed reports and native histories are not passed
+to the next stage.
+
+In Phase 1, queued and running siblings finish independently. Successful
+PASS/FAIL branches reconcile memory in their original order, using private
+staging banks. Only a completed, audited learning update is installed into the
+canonical bank. Failed learning leaves that bank unchanged and is quarantined
+with the failed branch. Once this wave settles, any isolated project ends BRS
+with `status: partial` and advances to DRS with the committed bank. A failed
+Curriculum turn likewise retains the preceding bank; it is not called SATURATED.
+State records distinguish attempted project indices, `committed_projects` and
+`isolated_projects`, including the case where no new project committed memory.
+
+In Phase 2, practice and target learning also stage their memory updates.
+An exceptional subtask ends training with `status: partial`, `verdict: null`
+and `transition_reason: isolated_subtask`. Earlier committed practice/target
+memory is frozen for a fresh Phase 3 attempt. No READY or PASS is invented.
+The final result and agent metadata record `training_status: partial`; only
+the unchanged official grader determines the final task score.
+
+Public-corpus failure, canonical-memory drift, failures publishing canonical
+storage, user interruption and final evaluation failures remain fatal. Shared
+OSWorld/ALE engines retain strict behavior unless the new option is explicitly
+enabled. Set the coding template option to false for the prior abort-on-error
+policy. The policy is recorded in the protocol and cannot change during resume.
+Historical quarantined runs are not automatically relabeled, resumed or regraded.
+Existing recovery still requires its admitted complete-boundary contract; this
+policy is forward execution, not a new recovery path for partial old runs.
 
 DRS learns from both grounded FAIL and PASS. Curriculum can choose a contrast
 after PASS; any practice requires another fresh original-target attempt. A PASS
@@ -71,7 +108,7 @@ Only inventory names/sizes enter the Actor opening, never host-selected memory
 contents. The Actor chooses retrieval. This run is target-conditioned learning
 followed by fresh evaluation of the same target, **not a held-out transfer test**.
 
-Final baseline work budget remains 10200 seconds. DRS target attempts use the
+Final baseline work budget is 18000 seconds (5h). DRS target attempts use the
 reference 36000-second ceiling; learning roles use 86400 seconds and 2000 model
 rounds per phase. These are undisclosed safety bounds, not semantic stop signals.
 Native 200-round segments resume the same conversation. Confirmed recoverable
@@ -109,6 +146,60 @@ Live Docker/model execution still requires a host shell with Docker access.
 
 ## Verifier cache isolation and recovery
 
+Practice Verifiers now start in a byte-verified disposable candidate copy at
+`/tmp/verifier-scratch/candidate`. The captured candidate and original fixtures
+remain independently inventoried. Internal symlinks into the candidate are
+rebased into the copy. The copy is rebuilt for each inspection while its fixed
+path preserves native session identity.
+
+Tests and builds run in that copy. Only narrowly validated Vitest result-cache
+JSON (`node_modules/.vite/vitest/[optional SHA1]/results.json`), recognized new
+Python caches, and semantic-preserving Git index refreshes may differ there.
+Existing cache files in the original candidate remain protected. Source edits,
+unknown additions and arbitrary `.vite`/`.cache` files are rejected. Each
+inspection records `workspace.json` and both original/copy checks in `integrity.json`.
+Rust build output is redirected with `CARGO_TARGET_DIR`, outside published
+practice material and the Verifier's candidate copy.
+
+`tools/smoke_deepswe_cache.py` provides an offline, no-model integration check
+inside the official Koota task image. It runs real Vitest against an existing
+cache, verifies that only the copy changed, and checks rejection of a source edit.
+
+## Boundary and Completion Diagnostics
+
+Candidate audit no longer decodes arbitrary binary bytes with replacement and
+joins them into artificial instruction text. UTF-8 text is scanned normally;
+binary artifacts are scanned as separate printable ASCII runs. Other-task
+matches require at least four distinct tokens and four tokens of length three
+or more. Meaningful copied instructions and protected evaluation paths still
+trigger rejection, including real strings embedded in binary artifacts.
+
+Transcript auditing uses native events, not the host-authored prompt metadata.
+Protected-path prohibitions quoted in prose do not count as filesystem actions;
+executed tool inputs and outputs remain audited. Practice prompts explicitly
+prohibit evaluation directories and specify the sole completion location and
+format. These prompt constraints do not constitute a new OS-level sandbox;
+actual boundary violations still reject the affected work. The configured
+subtask-isolation policy determines whether the whole training run must stop.
+
+Host-only `boundary-audit.json` records the rule, stream line/field or archive
+member and bounded matching evidence. Secrets are redacted before persistence;
+other-task matching text is not sent back to models. Reports are bounded to
+100 detailed findings while retaining the total count.
+
+RSI completion parsing reports JSON location, stale identity, wrong boolean,
+unexpected fields or invalid checks without copying submitted content into the
+error. The nonce, exact allowed keys and evidence requirements remain strict.
+`handoff_error` is saved in both native checkpoints and role outcomes and is
+included in same-session recovery guidance. Each retry still uses a fresh
+handoff identity; report-recovery limits are unchanged. Practice Verifiers are
+explicitly told to write plain report text despite the `.json` transport suffix.
+
+The historical quarantined runs remain quarantined. These changes do not
+rewrite old verdicts, remove old evidence, or bypass recovery eligibility checks.
+
+## Original-Tree Cache Recovery
+
 Coding practice Verifiers receive `PYTHONDONTWRITEBYTECODE=1`, a scratch
 `PYTHONPYCACHEPREFIX`, `PYTEST_ADDOPTS` selecting a scratch cache directory,
 `XDG_CACHE_HOME`, and `HYPOTHESIS_STORAGE_DIRECTORY` under `/tmp/verifier-scratch`.
@@ -144,10 +235,10 @@ again or alter its PASS/FAIL/UNVERIFIED report. `tools/rsi_recovery.py inspect`
 includes these records. This recovery operates on a live inspection; old stopped
 jobs are not automatically resumed or retroactively accepted.
 
-An unrecoverable BRS branch failure now aborts other coding branches and cancels
-queued work, then settles their native processes before environment cleanup.
-It records `RSI_BRANCHES_ABORTED`, never commits a partial wave, and leaves the
-original VM runtime's scheduling policy unchanged.
+Under the strict policy, an unrecoverable BRS branch failure aborts sibling
+coding calls and records `RSI_BRANCHES_ABORTED`. Under the default coding
+isolation policy, only rejected work is quarantined; siblings continue and
+their completed learning can be committed before an explicit partial transition.
 
 ## Native checkpoint diagnostics and recovery
 

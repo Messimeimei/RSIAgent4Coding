@@ -1,5 +1,6 @@
+# Full RSI, independent of native and baseline jobs.
 jobs_dir: results/deepswe/jobs
-job_name: bitfun-abs-baseline-qwen38-001
+job_name: bitfun-rsi
 n_attempts: 1
 n_concurrent_trials: 1
 timeout_multiplier: 1
@@ -31,17 +32,27 @@ environment:
       bind:
         create_host_path: false
 agents:
-  - name: bitfun-baseline
-    import_path: benchmarks.deepswe.baseline:BitfunBaseline
+  - name: bitfun-rsi
+    import_path: benchmarks.deepswe.rsi:BitfunRSI
     model_name: DeepSeek-V4.1-Flash-1017
     kwargs:
       binary_path: /usr/local/bin/bitfun
       output_patch_path: null
-      max_rounds: 3
-      verifier_attempts: 2
-      actor_timeout_sec: 3600
-      verifier_timeout_sec: 600
-      total_timeout_sec: 10200
+      # Phase 3 keeps the existing baseline work budget. The RSI-only Pier
+      # adapter applies per-role/per-attempt clocks, with no global DRS cap.
+      total_timeout_sec: 18000
+      learning_timeout_sec: 86400
+      target_learning_timeout_sec: 36000
+      brs_project_budget: 8
+      parallel: 1
+      # Quarantine exceptional subtasks; advance with committed memory only.
+      isolate_failed_projects: true
+      report_recovery_attempts: 2
+      # In-place archive repair; no model replay and no charge to role work clock.
+      checkpoint_repair_timeout_sec: 3600
+      command_timeout_sec: 600
+      stall_recovery: true
+      allow_role_swap: true
       bitfun_config: &common_bitfun
         app:
           logging:
@@ -64,7 +75,7 @@ agents:
           default_models:
             primary: DeepSeek-V4.1-Flash-1017
             fast: DeepSeek-V4.1-Flash-1017
-      verifier_bitfun_config:
+      verifier_bitfun_config: &review_model
         <<: *common_bitfun
         ai:
           models:
@@ -75,7 +86,8 @@ agents:
           default_models:
             primary: Qwen3.8-Flash
             fast: Qwen3.8-Flash
+      curriculum_bitfun_config: *review_model
 datasets:
   - path: ../DeepSWE/tasks
     task_names:
-      - abs-module-cache-flags
+      - dateutil-rfc5545-timezone-interop

@@ -1,6 +1,6 @@
 # 路径相对于 RSIAgent4Coding，被 run_deepswe.py 读取解析
 jobs_dir: results/deepswe/jobs
-job_name: bitfun-abs-module # 记录这次实验的名字
+job_name: bitfun-native
 n_attempts: 1
 n_concurrent_trials: 1
 timeout_multiplier: 1
@@ -62,4 +62,4 @@ agents:
 datasets:
   - path: ../DeepSWE/tasks
     task_names:
-      - abs-module-cache-flags # 真正要执行的任务
+      - dateutil-rfc5545-timezone-interop # 真正要执行的任务

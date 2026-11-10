@@ -186,7 +186,8 @@ async def test_verifier_cache_recovery_keeps_verdict_and_calls_model_once(tmp_pa
     native = SimpleNamespace(session_id="verifier-id", rsi_work_usage=(7, 0))
     runtime = object.__new__(CodingRuntime)
     runtime.execute = AsyncMock(return_value=(report, native))
-    runtime.integrity_command = AsyncMock(side_effect=[{}, {"status": "cache_recovered", "removed": ["cache"]}])
+    runtime.integrity_command = AsyncMock(side_effect=[{}, {"status": "prepared"},
+        {"status": "cache_recovered", "removed": ["cache"]}, {"status": "verified"}])
     events = []
     runtime.owner = SimpleNamespace(event=lambda *a, **kw: events.append((a, kw)))
     session = SimpleNamespace(inspections=0)
@@ -206,7 +207,8 @@ async def test_verifier_real_drift_preserves_workspace_and_diagnostic(tmp_path):
     runtime = object.__new__(CodingRuntime)
     runtime.execute = AsyncMock(return_value=("VERDICT: PASS", SimpleNamespace(
         session_id="verifier-id", rsi_work_usage=(1, 0))))
-    runtime.integrity_command = AsyncMock(side_effect=[{}, {"status": "rejected", "changed": ["answer.py"]}])
+    runtime.integrity_command = AsyncMock(side_effect=[{}, {"status": "prepared"},
+        {"status": "rejected", "changed": ["answer.py"]}, {"status": "verified"}])
     env = object()
     vm = SimpleNamespace(environment=env)
     cfg = SimpleNamespace(wall_clock_secs=100, max_iters=30, verifier_unverified_evidence=False)

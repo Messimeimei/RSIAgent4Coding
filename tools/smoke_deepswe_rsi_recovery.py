@@ -239,7 +239,7 @@ async def smoke(args, endpoint):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", required=True)
-    parser.add_argument("--config", type=Path, default=ROOT / "config/deepswe/rsi-bitfun.yaml",
+    parser.add_argument("--config", type=Path, default=ROOT / "config/deepswe/rsi.yaml",
                         help="Experiment config (all model endpoints are replaced with the local stub)")
     parser.add_argument("--bind-host", default="169.254.30.1")
     parser.add_argument("--port", type=int, default=0)

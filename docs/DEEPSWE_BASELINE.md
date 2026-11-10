@@ -42,25 +42,25 @@ system-message precedence or identical model behavior. The pinned CLI's `exec
 --help` identifies MESSAGE as a user message and exposes no system-prompt flag.
 Source hashes and `prompt_policy` / `prompt_delivery` record this distinction.
 
-## H20 usage
+## Usage
 
-Run from `/data/k8s/yx/RSIAgent4Coding`:
+Run from the repository root:
 
 ```bash
 .runtime/deepswe/venv/bin/python run_deepswe.py check --mode baseline \
-  --config config/deepswe/two-tasks-baseline-v2.yaml --name baseline-v2-check
+  --task dateutil-rfc5545-timezone-interop \
+  --task dynamodb-toolbox-lazy-recursive-schemas --verifier-model Qwen3.8-Flash
 .runtime/deepswe/venv/bin/python run_deepswe.py run --mode baseline \
-  --config config/deepswe/two-tasks-baseline-v2.yaml \
-  --task dateutil-rfc5545-timezone-interop --name dateutil-baseline-v2-001
+  --task dateutil-rfc5545-timezone-interop --verifier-model Qwen3.8-Flash
 ```
 
-Replace `--task` with `dynamodb-toolbox-lazy-recursive-schemas` for the second task.
-Omit `--task` to run both with `n_concurrent_trials: 1`. Pier may reorder tasks;
-separate invocations make the order explicit. Always use a new job name.
+Repeat `--task` to select multiple tasks, or use `--tasks-file tasks.txt`.
+The default concurrency is one. Pier may reorder tasks; separate invocations
+make the order explicit. A unique job name is generated unless `--name` is supplied.
 Without `--mode baseline`, the existing native BitFun behavior is preserved.
 
-The two-task YAML uses DeepSeek-V4.1-Flash-1017 for the Actor and Qwen3.8-Flash
-for the Verifier. Credentials still come from `.runtime/deepswe/runtime.env`
+The baseline template uses DeepSeek-V4.1-Flash-1017 for both roles. The example
+overrides only the Verifier with Qwen3.8-Flash. Credentials come from `.runtime/deepswe/runtime.env`
 or existing shell variables. Keys are referenced as `${API_KEY}`, not written
 into job configurations. Model URLs must be explicit. Review containers retain
 the task's no-network policy except for the authenticated model proxy allowlist.
@@ -135,8 +135,8 @@ propagate as infrastructure errors and block grading.
 
 ## Budget and compatibility
 
-The default remains 10200 seconds (2h50m) of SHARED working time, with Pier's
-10800-second working-time limit leaving 600 seconds for cleanup. Actor, Verifier,
+The default is 18000 seconds (5h) of SHARED working time, with the template's
+18600-second Pier working-time limit leaving 600 seconds for cleanup. Actor, Verifier,
 completion probes, ordinary inference and semantic/protocol repair share one
 clock across native segments and fresh-context recovery. Initial task/session
 preparation precedes that clock and has its own 300-second infrastructure timeout;

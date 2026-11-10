@@ -159,7 +159,7 @@ async def smoke(args, endpoint):
     from pier.job import Job
     from run_deepswe import load_job
 
-    job_config = load_job(ROOT / "config/deepswe/dateutil-bitfun.yaml", name=args.name)
+    job_config = load_job(ROOT / "config/deepswe/native.yaml", name=args.name)
     job_config.jobs_dir = ROOT / "results/deepswe/smoke"
     agent = job_config.agents[0]
     agent.override_timeout_sec = 180

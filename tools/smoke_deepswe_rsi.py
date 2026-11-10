@@ -210,7 +210,7 @@ class RSIStub(ModelStub):
 async def smoke(args, endpoint):
     from pier.job import Job
     from run_deepswe import load_job
-    config = load_job(ROOT / 'config/deepswe/rsi-bitfun.yaml', name=args.name, mode='rsi')
+    config = load_job(ROOT / 'config/deepswe/rsi.yaml', name=args.name, mode='rsi')
     config.jobs_dir = ROOT / 'results/deepswe/smoke'
     cfg = config.agents[0]
     cfg.model_name = 'rsi-mock'

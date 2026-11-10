@@ -26,12 +26,12 @@ from core.loop import LoopResult
 from core.verifier import _parse_agentic_verifier_report
 from explore.practice_loop import PracticeHooks, PracticeInfrastructureError, _read_guest_text
 from explore import commit
-from .contracts import HandoffError, CompletionCheck
+from .contracts import HandoffError, read_role_completion
 from .review_environment import make_review_environment
 from .rsi_prompts import practice_prompt, practice_verifier_prompt
 from .rsi_checkpoint import NativeCheckpoints, atomic_json
 from .bitfun_agent import credential_variables
-from .rsi_integrity import VERIFIER_CACHE_ENV
+from .rsi_integrity import VERIFIER_CACHE_ENV, VERIFIER_WORKDIR
 from .supervision import EventJournal
 from .work_budget import WorkBudget
 from .docker_lifecycle import cleanup_environment
@@ -74,44 +74,93 @@ class CodingAudit:
         if re.search(
             r"(?<![\w./-])/(?:tests/(?:test\.sh|test\.patch|grader\.py|config\.json)"
             r"(?=$|[\s'\"`])|solution/(?:solve\.sh|solution\.patch)(?=$|[\s'\"`])"
-            r"|logs/verifier/)", text):
+            r"|logs/verifier(?:/|(?=$|[\s'\"`])))", text):
             hits.append({"kind": "sealed-evaluation-surface"})
-        if (commit._shingles(text) & self.grams) - self.allowed - commit._shingles(authorized_instruction):
-            hits.append({"kind": "other-task-instruction"})
+        authorized = set() if authorized_instruction == self.instruction else commit._shingles(authorized_instruction)
+        overlaps = (commit._shingles(text) & self.grams) - self.allowed - authorized
+        # Placeholder letters and repeated tokens are not evidence of copied instructions.
+        overlaps = sorted(gram for gram in overlaps
+            if len(set(gram.split())) >= 4 and sum(len(word) >= 3 for word in gram.split()) >= 4)
+        if overlaps:
+            hits.append({"kind": "other-task-instruction", "match_count": len(overlaps),
+                         "matches": overlaps[:4]})
         return hits
 
-    def transcripts(self, root, **kwargs):
+    def _record(self, root, scope, hits, *, binary_files=0):
+        clean = getattr(self, "clean", lambda value: value)
+        write_json(Path(root) / "boundary-audit.json", json.loads(clean(json.dumps({
+            "scope": scope, "status": "rejected" if hits else "passed",
+            "finding_count": len(hits), "binary_files_scanned": binary_files,
+            "findings": hits[:100], "findings_truncated": len(hits) > 100,
+        }))))
+
+    def transcripts(self, root, record_findings=True, **kwargs):
         hits = []
-        for path in Path(root).rglob("transcript.json"):
-            hits.extend(self.text(path.read_text(), **kwargs))
+        # transcript.json is host-authored prompt/transport metadata, not agent output.
+        # In particular, explicit forbidden-path instructions must not audit themselves.
         for path in Path(root).rglob("stream-*.jsonl"):
             # Inspect decoded native events, including actual observations, not
             # merely the host reference to their location.
             with path.open(errors="replace") as stream:
-                for line in stream:
+                for number, line in enumerate(stream, 1):
                     try:
                         event = json.loads(line)
                     except ValueError:
                         continue
-                    def inspect(value):
+                    payload = event.get("event", {}) if isinstance(event, dict) else {}
+                    payload = payload if isinstance(payload, dict) else {}
+                    action = payload.get("tool_event") or {}
+                    action = action if isinstance(action, dict) else {}
+                    executed_tool = action.get("event_type") in {"Started", "Completed"}
+
+                    def inspect(value, field="$"):
                         if isinstance(value, str):
-                            hits.extend(self.text(value, **kwargs))
+                            found = self.text(value, **kwargs)
+                            # A prohibition quoted in model prose is not a filesystem access.
+                            if not executed_tool:
+                                found = [hit for hit in found if hit["kind"] != "sealed-evaluation-surface"]
+                            hits.extend({**hit, "file": str(path), "line": number,
+                                         "field": field} for hit in found)
                         elif isinstance(value, dict):
-                            for child in value.values():
-                                inspect(child)
+                            for key, child in value.items():
+                                inspect(child, field + "." + key)
                         elif isinstance(value, list):
-                            for child in value:
-                                inspect(child)
+                            for index, child in enumerate(value):
+                                inspect(child, f"{field}[{index}]")
                     inspect(event)
+        if record_findings:
+            self._record(root, "transcripts", hits)
         return hits
 
-    def captured(self, root, **kwargs):
+    def captured(self, root, record_findings=True, **kwargs):
         hits = []
+        binary_files = 0
         with tarfile.open(Path(root) / "materials.tgz") as archive:
             for item in archive:
-                hits.extend(self.text(item.name, **kwargs))
+                hits.extend({**hit, "member": item.name, "surface": "path"}
+                            for hit in self.text(item.name, **kwargs))
                 if item.isfile():
-                    hits.extend(self.text(archive.extractfile(item).read().decode("utf-8", "ignore"), **kwargs))
+                    raw = archive.extractfile(item).read()
+                    try:
+                        text = raw.decode("utf-8")
+                    except UnicodeError:
+                        text = None
+                    if text is not None and "\x00" not in text:
+                        segments = [(0, text)]
+                        binary = False
+                    else:
+                        # Scan real embedded strings independently; never join machine-code
+                        # fragments across undecodable bytes into artificial word sequences.
+                        binary_files += 1
+                        binary = True
+                        segments = ((match.start(), match.group().decode("ascii"))
+                                    for match in re.finditer(rb"[\x20-\x7e]{8,}", raw))
+                    for offset, text in segments:
+                        hits.extend({**hit, "member": item.name, "surface": "content",
+                                     "binary": binary, "offset": offset}
+                                    for hit in self.text(text, **kwargs))
+        if record_findings:
+            self._record(root, "candidate", hits, binary_files=binary_files)
         return hits
 
     def memory(self, files, corpus_path, reject_log, **kwargs):
@@ -176,6 +225,7 @@ class CodingRuntime:
         self.checkpoints = NativeCheckpoints(self.root / "private-sessions",
             secrets=[extra.get(key) or os.environ.get(key) for key in credentials],
             repair_timeout=getattr(owner, "checkpoint_repair_timeout_sec", 3600))
+        self.audit.clean = self.checkpoints.clean
         self.hooks = PracticeHooks(
             run_attempt=self.run_attempt, reset_vm=self.reset,
             read_guest_text=self.read_text,
@@ -185,6 +235,7 @@ class CodingRuntime:
             verify_agentic=self.verify, actor_evidence_leads=self.evidence_leads,
             role_work_usage=lambda session: session.bitfun_work_usage,
             branch_failure=self.fail_pending_branches,
+            format_isolation_error=self.checkpoints.clean,
         )
 
     def call(self, coroutine):
@@ -389,7 +440,8 @@ class CodingRuntime:
                     raise PracticeInfrastructureError("Missing native checkpoint for resumed controller")
                 record = json.loads(manifest.read_text())
                 if (record.get("session_id") != session_id or record.get("role") != role
-                        or record.get("working_dir") not in {"/home/user", "/app"}
+                        or record.get("working_dir") not in {"/home/user", "/app", VERIFIER_WORKDIR}
+                        or (record.get("working_dir") == VERIFIER_WORKDIR and role != "verifier")
                         or type(record.get("call")) is not int or record["call"] < 1):
                     raise PracticeInfrastructureError("Invalid native checkpoint identity/role/call")
                 session = self.owner._session(log_dir, self.owner.role_configs()[role], session_id=session_id)
@@ -399,10 +451,13 @@ class CodingRuntime:
             session.logs_dir = log_dir
         else:
             session = self.owner._session(log_dir, self.owner.role_configs()[role])
-            working_dir = "/home/user"
+            working_dir = VERIFIER_WORKDIR if role == "verifier" else "/home/user"
             self.sessions[session.session_id] = (session, working_dir)
         if role == "verifier":
             session._extra_env = {**session._extra_env, **VERIFIER_CACHE_ENV}
+        elif working_dir != "/app":
+            session._extra_env = {**getattr(session, "_extra_env", {}),
+                                  "CARGO_TARGET_DIR": "/tmp/rsiagent-build/cargo"}
         # A native conversation is restored ONLY to its owning role's container.
         # Target learning initially adopts the actual live baseline Actor.
         if session.session_id in self.adopted_live:
@@ -446,21 +501,7 @@ class CodingRuntime:
                     target_learning=working_dir == "/app")
 
                 def reader(path):
-                    try:
-                        value = json.loads(path.read_text())
-                    except (ValueError, OSError):
-                        raise HandoffError("Missing role completion")
-                    if not isinstance(value, dict):
-                        raise HandoffError("Role completion must be an object")
-                    expected = {"kind": "rsi_done", "handoff_id": handoff_id, "final": True}
-                    if path.is_symlink() or any(value.get(k) != v for k, v in expected.items()) or set(value) - set(expected) - {"checks"}:
-                        raise HandoffError("Invalid role completion identity")
-                    try:
-                        checks = [CompletionCheck.model_validate(v) for v in value.get("checks", [])]
-                    except (ValueError, TypeError):
-                        raise HandoffError("Invalid evidence checks")
-                    if evidence_requested and not checks:
-                        raise HandoffError("Evidence response requires reproducible checks")
+                    value, checks = read_role_completion(path, handoff_id, require_checks=evidence_requested)
                     self.done_checks[session.session_id] = checks
                     return value
             (sink_root / f"prompt-{session.calls + 1:03d}.txt").write_text(rendered)
@@ -484,6 +525,7 @@ class CodingRuntime:
                 "call": session.calls, "status": outcome.status, "report": outcome.report,
                 "metrics": outcome.metrics, "handoff_id": handoff_id,
                 "error": outcome.error,
+                "handoff_error": getattr(outcome, "handoff_error", None),
                 "checkpoint_status": "pending"})
             if not isinstance(outcome.metrics, dict) or any(
                     type(outcome.metrics.get(key, 0)) is not int or outcome.metrics.get(key, 0) < 0
@@ -551,9 +593,14 @@ class CodingRuntime:
                 raise PracticeInfrastructureError("BitFun role stopped: " + outcome.status
                     + (": " + self.checkpoints.clean(outcome.error) if outcome.error else ""))
             failures += 1
+            reason = self.checkpoints.clean(getattr(outcome, "handoff_error", None) or outcome.status)
             if failures > self.owner.report_recovery_attempts:
-                raise PracticeInfrastructureError("BitFun completion transport recovery exhausted")
-            prompt += "\nThe completion envelope was missing or invalid. Continue this same phase and publish it after completing the required files."
+                raise PracticeInfrastructureError("BitFun completion transport recovery exhausted: " + reason)
+            prompt += ("\nThe preceding completion was rejected: " + reason +
+                       ". Preserve completed work. Use only the new completion path and identity "
+                       "specified in this invocation; do not reuse an earlier envelope. "
+                       "The explicit transport instructions below are the complete format; "
+                       "do not search other log directories for a schema.")
 
     def _save_evidence(self, path, identity, sink_root, call):
         journal = EventJournal(path, identity, record_observations=True)
@@ -593,6 +640,11 @@ class CodingRuntime:
         inspection = Path(sink.root) / f"inspection_{session.inspections:03d}"
         before_path = inspection / "integrity-before.json"
         atomic_json(before_path, await self.integrity_command(vm, "inventory"))
+        workspace = await self.integrity_command(vm, "prepare", before_path)
+        if workspace.get("status") != "prepared":
+            raise PracticeInfrastructureError("Cannot prepare byte-verified Verifier working copy")
+        workspace_path = inspection / "workspace.json"
+        atomic_json(workspace_path, workspace)
         report, native = await self.execute(
             vm, project, "verifier", inspection,
             session_id=getattr(session, "bitfun_session_id", None),
@@ -608,10 +660,11 @@ class CodingRuntime:
         # cache additions, without resampling the verdict or touching Actor work.
         vm.integrity_blocked = True
         integrity = await self.integrity_command(vm, "recover", before_path)
+        integrity["working_copy"] = await self.integrity_command(vm, "verify-copy", workspace_path)
         atomic_json(inspection / "integrity.json", integrity)
-        if integrity["status"] == "rejected":
+        if integrity["status"] == "rejected" or integrity["working_copy"]["status"] == "rejected":
             raise PracticeInfrastructureError(
-                f"Verifier changed protected candidate/fixtures; workspace preserved; see {inspection / 'integrity.json'}")
+                f"Verifier changed protected candidate/fixtures or verification source; workspace preserved; see {inspection / 'integrity.json'}")
         vm.integrity_blocked = False
         if integrity["status"] == "cache_recovered":
             self.owner.event("VERIFIER_CACHE_RECOVERED", session_id=native.session_id,

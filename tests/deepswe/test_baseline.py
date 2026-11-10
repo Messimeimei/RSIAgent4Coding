@@ -112,7 +112,7 @@ def test_modes_preserve_native_default(tmp_path):
     assert not (tmp_path / "untouched").exists()
     with pytest.raises(ValueError, match="matching"):
         load_job(select_config("native"), mode="baseline")
-    assert select_config("native") == ROOT / "config/deepswe/dateutil-bitfun.yaml"
+    assert select_config("native") == ROOT / "config/deepswe/native.yaml"
 
 
 @pytest.mark.parametrize(

@@ -178,6 +178,10 @@ OSWorld stages are Python modules under `benchmarks/osworld/`; see the
 
 ## ⚙️ Installation
 
+For the DeepSWE coding adapter, use the dedicated
+[setup, CLI and real-provider smoke guide](docs/DEEPSWE.md).
+Its `native`, `baseline` and `rsi` modes run in Docker without a desktop VM.
+
 Use Python 3.12, [uv](https://docs.astral.sh/uv/getting-started/installation/),
 and a Linux host with Docker and access to `/dev/kvm`. Start with the repository
 and your own model API credential:

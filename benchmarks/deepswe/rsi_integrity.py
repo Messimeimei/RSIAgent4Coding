@@ -11,8 +11,10 @@ import base64
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -26,7 +28,9 @@ VERIFIER_CACHE_ENV = {
     "PYTEST_ADDOPTS": "-o cache_dir=/tmp/verifier-scratch/pytest-cache",
     "XDG_CACHE_HOME": "/tmp/verifier-scratch/xdg-cache",
     "HYPOTHESIS_STORAGE_DIRECTORY": "/tmp/verifier-scratch/hypothesis",
+    "CARGO_TARGET_DIR": "/tmp/verifier-scratch/cargo-target",
 }
+VERIFIER_WORKDIR = "/tmp/verifier-scratch/candidate"
 PROTECTED_ROOTS = ("/home/user/evolution_project", "/home/user/.practice_original_project")
 
 
@@ -145,6 +149,109 @@ def recognized_cache(root, name, entry, before):
     return value is None or isinstance(value, (list, str, dict))
 
 
+def prepare_working_copy(before, destination=VERIFIER_WORKDIR):
+    """Create a verified disposable copy, leaving every original byte protected."""
+    destination = Path(destination)
+    source = PROTECTED_ROOTS[0] if PROTECTED_ROOTS[0] in before else next(iter(before))
+    if before[source] is None or inventory(before) != before:
+        raise ValueError("Candidate changed before preparing verification workspace")
+    original_root, resolved_destination = Path(source).resolve(), destination.resolve()
+    if (destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents)
+            or original_root == resolved_destination or original_root in resolved_destination.parents
+            or resolved_destination in original_root.parents):
+        raise ValueError("Invalid verification workspace")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=destination.parent, prefix="prepare-") as staging:
+        copied = Path(staging) / "candidate"
+        shutil.copytree(source, copied, symlinks=True)
+        expected = dict(before[source])
+        # Absolute links into the candidate must point into the copy, so cache
+        # writes through such links cannot modify the protected original tree.
+        for name, entry in before[source].items():
+            if entry["kind"] != "symlink":
+                continue
+            original = Path(source) / name
+            target = (original.parent / entry["target"]).resolve()
+            if target.is_relative_to(Path(source).resolve()):
+                mapped = str(destination / target.relative_to(Path(source).resolve()))
+                link = copied / name
+                link.unlink()
+                link.symlink_to(mapped)
+                expected[name] = {"kind": "symlink", "target": mapped}
+        if inventory([str(copied)])[str(copied)] != expected or inventory(before) != before:
+            raise ValueError("Verification copy does not match the candidate")
+        if destination.exists():
+            shutil.rmtree(destination)
+        copied.rename(destination)
+    return {"status": "prepared", "source": source, "working_copy": str(destination),
+            "files": sum(entry["kind"] == "file" for entry in before[source].values()),
+            "original_unchanged": True, "inventory": expected,
+            "result_caches": [name for name, entry in expected.items()
+                              if vitest_result_cache(destination, name, entry)]}
+
+
+def vitest_result_cache(root, name, entry):
+    """Only typed Vitest metadata in the disposable copy may be rewritten."""
+    if (entry.get("kind") != "file" or entry["bytes"] > 16 * 1024 * 1024
+            or not re.fullmatch(r"(?:[^/]+/)*node_modules/\.vite/vitest/(?:[0-9a-f]{40}/)?results\.json", name)):
+        return False
+    try:
+        value = json.loads((Path(root) / name).read_text())
+    except (ValueError, UnicodeError, OSError):
+        return False
+    if (not isinstance(value, dict) or set(value) != {"version", "results"}
+            or not isinstance(value["version"], str) or not value["version"]
+            or not isinstance(value["results"], list)):
+        return False
+    for item in value["results"]:
+        if (not isinstance(item, list) or len(item) != 2 or not isinstance(item[0], str)
+                or not isinstance(item[1], dict) or set(item[1]) != {"duration", "failed"}):
+            return False
+        duration = item[1]["duration"]
+        if type(item[1]["failed"]) is not bool or type(duration) not in {int, float} or not math.isfinite(duration) or duration < 0:
+            return False
+    return True
+
+
+def verify_working_copy(workspace):
+    root, expected = workspace["working_copy"], workspace["inventory"]
+    actual = inventory([root])[root]
+    rejected, caches, indexes = [], [], []
+    if actual is None:
+        return {"status": "rejected", "changed": [root], "result_caches": []}
+    for name, entry in expected.items():
+        if actual.get(name) == entry:
+            continue
+        path = Path(root) / name
+        if path.name == "index" and path.parent.name == ".git" and name in actual:
+            indexes.append((path, entry, actual[name]))
+            continue
+        if (name in workspace["result_caches"] and name in actual
+                and vitest_result_cache(root, name, actual[name])):
+            caches.append(name)
+        else:
+            rejected.append(name)
+    allowed_dirs = set()
+    for name, entry in actual.items():
+        if name in expected or entry["kind"] == "directory":
+            continue
+        if vitest_result_cache(root, name, entry) or recognized_cache(root, name, entry, expected):
+            caches.append(name)
+            allowed_dirs.update(parent.as_posix() for parent in Path(name).parents)
+        else:
+            rejected.append(name)
+    rejected.extend(name for name, entry in actual.items()
+                    if name not in expected and entry["kind"] == "directory" and name not in allowed_dirs)
+    refreshed = []
+    for path, entry, current in indexes:
+        if rejected or not index_metadata_only(path, entry, current):
+            rejected.append(path.relative_to(root).as_posix())
+        else:
+            refreshed.append(path.relative_to(root).as_posix())
+    return {"status": "rejected" if rejected else "verified", "changed": sorted(rejected),
+            "result_caches": sorted(caches), "git_index_metadata_drift": refreshed}
+
+
 def recover(before):
     after = inventory(before)
     report = {"status": "unchanged", "changed": [], "missing": [], "unexpected": [],
@@ -229,6 +336,10 @@ def main():
             raise ValueError("Missing candidate before Verifier inspection")
     elif sys.argv[1] == "recover":
         result = recover(json.loads(Path(sys.argv[2]).read_text()))
+    elif sys.argv[1] == "prepare":
+        result = prepare_working_copy(json.loads(Path(sys.argv[2]).read_text()))
+    elif sys.argv[1] == "verify-copy":
+        result = verify_working_copy(json.loads(Path(sys.argv[2]).read_text()))
     else:
         raise ValueError("Unknown integrity operation")
     print(json.dumps(result, ensure_ascii=False))

@@ -200,7 +200,7 @@ async def smoke(args, endpoint):
     from run_deepswe import load_job
 
     config = load_job(
-        ROOT / "config/deepswe/baseline-bitfun.yaml", name=args.name, mode="baseline"
+        ROOT / "config/deepswe/baseline.yaml", name=args.name, mode="baseline"
     )
     config.jobs_dir = ROOT / "results/deepswe/smoke"
     agent = config.agents[0]

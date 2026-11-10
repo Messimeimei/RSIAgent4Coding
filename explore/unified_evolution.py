@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,7 @@ from explore.target_learning import (
     _run_practice_attempt,
     _target_audit_surface,
 )
+from explore.project_isolation import isolate_artifacts, require_memory
 
 
 CURRICULUM_ROUTE_HANDOFF = "/home/user/curriculum_route.md"
@@ -299,7 +301,7 @@ def evolve_until_ready(
         hooks: PracticeHooks | None = None,
         event_sink: Callable[..., Any] | None = None,
         session: UnifiedCurriculumSession | None = None,
-        resume_boundary=None) -> PracticeResult:
+        resume_boundary=None, isolate_failed_projects=False) -> PracticeResult:
     """Let Curriculum choose experiences until it returns target control.
 
     ``phase2_outcome_protocol`` accepts either a grounded PASS or FAIL after the
@@ -307,6 +309,8 @@ def evolve_until_ready(
     and choose projects, but cannot edit or approve it. Other authorities retain
     the historical FAIL-only contract. A stalled, quarantined, or infrastructure
     result is not readiness and must not be converted into a target retry.
+    Opt-in coding callers may receive ``partial`` with committed memory for an
+    explicitly degraded transition to final evaluation.
     """
 
     if curriculum_memory_access not in {"read_only", "none"}:
@@ -367,6 +371,12 @@ def evolve_until_ready(
             for i, record in enumerate(records, 1))
     curriculum_notes = session.notes
     audit_target = _target_audit_surface(target, target_visible_inputs)
+    trusted_memory = None
+    transition_safe = False
+    isolation_source = None
+    isolation_index = None
+    isolation_stage = "curriculum"
+    isolated = []
 
     def emit(event_type: str, *, status: str, project_open: bool,
              memory_phase_open: bool, payload: dict[str, Any]) -> Any:
@@ -402,6 +412,8 @@ def evolve_until_ready(
                 routing_report.encode("utf-8")).hexdigest(),
             "memory_manifest": _manifest(memory),
             "memory_tree_sha256": _memory_tree_sha256(memory),
+            "isolated_projects": isolated,
+            "isolate_failed_projects": isolate_failed_projects,
         })
         return PracticeResult(
             status=status,
@@ -412,6 +424,19 @@ def evolve_until_ready(
             terminal_text=terminal_text,
             last_project=project_index,
         )
+
+    def finish_isolated(error):
+        hooks.validate_corpus(corpus_path)
+        require_memory(memory_dir, trusted_memory)
+        isolated.append(isolate_artifacts(lineage, isolation_source, error,
+            stage=isolation_stage, trusted_memory=trusted_memory, project_index=isolation_index,
+            error_details=hooks.format_isolation_error("".join(traceback.format_exception(error)))
+            if hooks.format_isolation_error else None))
+        session.history, session.notes = [], ""
+        emit("PRACTICE_PROJECT_ISOLATED", status="isolated", project_open=False,
+             memory_phase_open=False, payload={"project_index": isolation_index,
+             "stage": isolation_stage, "error_type": type(error).__name__, "memory_promoted": False})
+        return finish("partial", "Isolated failed practice; retaining committed memory only")
 
     try:
         if not target.strip():
@@ -525,6 +550,8 @@ def evolve_until_ready(
                     else accepted_memory),
             })
 
+        trusted_memory = _read_memory_tree(str(memory_dir))
+        transition_safe = True
         pending_practice = getattr(resume_boundary, "pending_practice", None)
         recovering_turn = resume_boundary is not None and pending_practice is None
         if recovering_turn:
@@ -535,6 +562,7 @@ def evolve_until_ready(
                 pending_practice = None
                 project_index += 1
                 episode_dir = episodes_dir / f"ep{project_index:03d}"
+                isolation_source, isolation_index, isolation_stage = episode_dir, project_index, "practice"
                 fixture_dir = episode_dir / "fixtures"
                 project = practice_resume["project"]
                 emit("PRACTICE_MEMORY_RESUMED" if practice_resume.get("resume_kind") == "verified_memory"
@@ -543,6 +571,8 @@ def evolve_until_ready(
                      payload={"project_index": project_index,
                               "recovery_plan": str(resume_boundary.plan_path)})
             else:
+                isolation_source = curriculum_dir / f"turn_{session.turns + 1:03d}"
+                isolation_index, isolation_stage = None, "curriculum"
                 # The target environment was already discarded by the unified state
                 # machine. Curriculum and practice run only on a fresh null-task VM.
                 _fresh_vm(hooks, vm, target)
@@ -648,6 +678,7 @@ def evolve_until_ready(
 
                     candidate_index = project_index + 1
                     episode_dir = episodes_dir / f"ep{candidate_index:03d}"
+                    isolation_source, isolation_index, isolation_stage = episode_dir, candidate_index, "fixtures"
                     fixture_dir = episode_dir / "fixtures"
                     try:
                         _require_owned_project_shape(vm)
@@ -673,28 +704,48 @@ def evolve_until_ready(
                         })
                     break
 
+            isolation_stage = "practice"
+            staging = episode_dir / "staged_memory" if isolate_failed_projects else memory_dir
+            if isolate_failed_projects:
+                hooks.install_memory(str(staging), trusted_memory)
             practice = _run_practice_attempt(
                 hooks=hooks, vm=vm, lineage=lineage,
                 episode_dir=episode_dir, project_index=project_index,
                 project=project, fixture_dir=fixture_dir, target=target,
                 actor_cfg=actor_cfg, verifier_cfg=verifier_cfg,
-                memory_dir=memory_dir, emit=emit,
+                memory_dir=staging, emit=emit,
                 agentic_verifier_cfg=agentic_verifier_cfg,
                 target_visible_inputs=target_visible_inputs,
                 **({"resume_state": practice_resume} if practice_resume is not None else {}))
-            experience_index += 1
+            isolation_stage = "memory_learning"
+            if not isolate_failed_projects:
+                experience_index += 1
+            next_experience = experience_index + 1 if isolate_failed_projects else experience_index
+            learning_events = []
+            def learning_emit(*args, **kwargs):
+                learning_events.append((args, kwargs))
             learned, diagnosis, _ = _promote_learning(
                 hooks=hooks, vm=vm, cfg=memory_cfg, lineage=lineage,
-                episode_dir=episode_dir, experience_index=experience_index,
+                episode_dir=episode_dir, experience_index=next_experience,
                 before_memory=practice["before_memory"],
                 actor_history=practice["actor_history"],
                 terminal_outcome=practice["terminal_outcome"],
                 verifier_report=practice["verifier_report"], target=target,
-                audit_mode="practice", emit=emit, project_open=True,
-                corpus_path=corpus_path, memory_dir=memory_dir,
-                journal_dir=journal_dir,
+                audit_mode="practice", emit=learning_emit if isolate_failed_projects else emit, project_open=True,
+                corpus_path=corpus_path, memory_dir=staging,
+                journal_dir=episode_dir / "staged_journal" if isolate_failed_projects else journal_dir,
                 experience_kind="unified-practice-project",
                 target_visible_inputs=target_visible_inputs)
+            transition_safe = False
+            if isolate_failed_projects:
+                hooks.validate_corpus(corpus_path)
+                require_memory(memory_dir, trusted_memory)
+                require_memory(staging, learned)
+                hooks.journal_memory(str(journal_dir), experience_index + 1, learned,
+                    {"kind": "unified-practice-project", "terminal_outcome": practice["terminal_outcome"]})
+                hooks.install_memory(str(memory_dir), learned)
+            if isolate_failed_projects:
+                experience_index += 1
             record = {
                 "schema_version": 1,
                 "kind": "unified_practice_project",
@@ -737,12 +788,22 @@ def evolve_until_ready(
                     "learning_diagnosis_sha256": hashlib.sha256(
                         diagnosis.encode("utf-8")).hexdigest(),
                 })
+            for args, kwargs in learning_events:
+                emit(*args, **kwargs)
+            trusted_memory = dict(learned)
+            transition_safe = True
 
     except PracticeBoundaryError as exc:
+        if isolate_failed_projects and transition_safe and isolation_source is not None:
+            return finish_isolated(exc)
         return finish("quarantined", str(exc))
     except PracticeInfrastructureError as exc:
+        if isolate_failed_projects and transition_safe and isolation_source is not None:
+            return finish_isolated(exc)
         return finish("infra", str(exc))
     except Exception as exc:  # noqa: BLE001 - durable inspectable incident
+        if isolate_failed_projects and transition_safe and isolation_source is not None:
+            return finish_isolated(exc)
         return finish("infra", f"{type(exc).__name__}: {exc}")
 
 
