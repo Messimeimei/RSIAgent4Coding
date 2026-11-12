@@ -108,7 +108,9 @@ Only inventory names/sizes enter the Actor opening, never host-selected memory
 contents. The Actor chooses retrieval. This run is target-conditioned learning
 followed by fresh evaluation of the same target, **not a held-out transfer test**.
 
-Final baseline work budget is 18000 seconds (5h). DRS target attempts use the
+Phase 3 work budget is 36000 seconds (10h), including standalone frozen-memory
+evaluations. Historical result configurations retain their original budgets.
+DRS target attempts use the
 reference 36000-second ceiling; learning roles use 86400 seconds and 2000 model
 rounds per phase. These are undisclosed safety bounds, not semantic stop signals.
 Native 200-round segments resume the same conversation. Confirmed recoverable

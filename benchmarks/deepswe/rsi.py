@@ -82,7 +82,7 @@ class MemoryBaseline(BitfunBaseline):
 
 class BitfunRSI(BitfunCli):
     def __init__(self, *args, verifier_bitfun_config=None,
-                 curriculum_bitfun_config=None, total_timeout_sec=18000,
+                 curriculum_bitfun_config=None, total_timeout_sec=36000,
                  learning_timeout_sec=86400, target_learning_timeout_sec=36000,
                  brs_project_budget=8, parallel=2, report_recovery_attempts=2,
                  checkpoint_repair_timeout_sec=3600,

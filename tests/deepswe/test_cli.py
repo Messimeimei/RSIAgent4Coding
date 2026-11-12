@@ -31,11 +31,11 @@ def test_templates_are_only_three_modes():
 
 
 @pytest.mark.parametrize("mode", ["baseline", "rsi"])
-def test_five_hour_work_budget_preserves_learning_and_cleanup_limits(mode):
+def test_mode_work_budgets_preserve_learning_and_cleanup_limits(mode):
     from pier.trial.execution import TrialExecution
     _, job = configured("--mode", mode)
     agent = job.agents[0]
-    assert agent.kwargs["total_timeout_sec"] == 18000
+    assert agent.kwargs["total_timeout_sec"] == (18000 if mode == "baseline" else 36000)
     if mode == "baseline":
         outer = TrialExecution._resolve_agent_timeout(
             agent_config=agent, task_agent_timeout_sec=10800,

@@ -37,6 +37,7 @@ class FrozenMemoryPhase3(MemoryBaseline):
             if not self.source_memory_path.is_dir() or _read_memory_tree(str(self.source_memory_path)) != memory:
                 raise ValueError("Frozen memory must match the source paths and bytes exactly")
         kwargs.pop("training", None)
+        kwargs.setdefault("total_timeout_sec", 36000)
         super().__init__(*args, memory=memory, training=False, **kwargs)
         self.frozen_memory_path = path
         self.frozen_memory_sha256 = _memory_tree_sha256(memory)

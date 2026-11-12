@@ -1,17 +1,13 @@
 # Runtime-only Phase-3 frozen-memory evaluation for dynamodb-toolbox.
 # Uses the controller-written pack under results/deepswe/phase3-memory/dynamodb-lazy-recursive-01.
 # Mirrors dateutil-phase3.yaml except: task, frozen_memory_path, job_name,
-# report_recovery_attempts (2 -> 5) and total_timeout_sec (10200 -> 14400).
+# report_recovery_attempts (2 -> 5). Phase 3 now uses a ten-hour work budget.
 jobs_dir: results/deepswe/jobs
 job_name: bitfun-dynamodb-rsi-phase3
 n_attempts: 1
 n_concurrent_trials: 1
 timeout_multiplier: 1
-# task.toml declares [agent] timeout_sec = 10800, and the preflight requires
-# total_timeout_sec < 10800 * timeout_multiplier * agent_timeout_multiplier.
-# 1.5 raises that ceiling to 16200 so the 14400s work budget fits.
-# DEVIATION from the source protocol, which used agent_timeout_multiplier: 1.
-agent_timeout_multiplier: 1.5
+agent_timeout_multiplier: 1
 verifier_timeout_multiplier: 1
 environment_build_timeout_multiplier: 1
 retry:
@@ -42,11 +38,12 @@ agents:
   - name: bitfun-phase3-frozen
     import_path: phase3_eval.frozen_phase3_agent:FrozenMemoryPhase3
     model_name: DeepSeek-V4.1-Flash-1017
+    override_timeout_sec: 36600
     kwargs:
       binary_path: /usr/local/bin/bitfun
       output_patch_path: null
       frozen_memory_path: /data/k8s/yx/RSIAgent4Coding/results/deepswe/phase3-memory/dynamodb-lazy-recursive-01/memory_frozen
-      total_timeout_sec: 14400
+      total_timeout_sec: 36000
       report_recovery_attempts: 5
       command_timeout_sec: 600
       stall_recovery: true

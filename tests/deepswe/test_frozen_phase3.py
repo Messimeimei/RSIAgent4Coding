@@ -50,6 +50,7 @@ class LocalEnvironment:
 @pytest.mark.asyncio
 async def test_nested_memory_is_transferred_and_hash_verified(phase3, tmp_path):
     obj = agent(phase3, tmp_path)
+    assert obj.total_timeout_sec == 36000
     env = LocalEnvironment(tmp_path / 'guest')
     await obj._push_frozen_memory(env)
     assert (env.root / 'memory/nested/deeper/lesson.md').read_text() == 'verified lesson'
@@ -76,6 +77,20 @@ def test_launcher_root_follows_checkout(monkeypatch):
     monkeypatch.syspath_prepend(str(root / '.runtime/deepswe'))
     launcher = importlib.import_module('phase3_eval.run_phase3_frozen')
     assert launcher.ROOT == root
+
+
+@pytest.mark.parametrize('template', ['dateutil-phase3.yaml', 'dynamodb-phase3.yaml'])
+def test_phase3_templates_allow_ten_hours_plus_cleanup(template):
+    from run_deepswe import ROOT, load_job
+    from pier.trial.execution import TrialExecution
+    job = load_job(ROOT / '.runtime/deepswe/phase3_eval' / template)
+    work = job.agents[0].kwargs['total_timeout_sec']
+    outer = TrialExecution._resolve_agent_timeout(
+        agent_config=job.agents[0], task_agent_timeout_sec=10800,
+        timeout_multiplier=job.timeout_multiplier,
+        agent_timeout_multiplier=job.agent_timeout_multiplier)
+    assert work == 36000
+    assert outer > work
 
 
 @pytest.mark.asyncio

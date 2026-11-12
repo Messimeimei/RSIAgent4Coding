@@ -38,9 +38,9 @@ agents:
     kwargs:
       binary_path: /usr/local/bin/bitfun
       output_patch_path: null
-      # Phase 3 keeps the existing baseline work budget. The RSI-only Pier
+      # Phase 3 uses a ten-hour work budget. The RSI-only Pier
       # adapter applies per-role/per-attempt clocks, with no global DRS cap.
-      total_timeout_sec: 18000
+      total_timeout_sec: 36000
       learning_timeout_sec: 86400
       target_learning_timeout_sec: 36000
       brs_project_budget: 8
