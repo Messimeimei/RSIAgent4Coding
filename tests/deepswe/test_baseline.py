@@ -214,6 +214,25 @@ async def test_handoff_detected_before_natural_exit(tmp_path, model):
     assert result.status == "handoff" and ended.is_set()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["PASS", "FAIL", "UNVERIFIED"])
+async def test_session_accepts_free_verifier_report(tmp_path, model, verdict):
+    session = BitfunSession(logs_dir=tmp_path, bitfun_config=model)
+    text = f"Independently observed evidence.\nVERDICT: {verdict}\n"
+
+    async def work(*args):
+        (tmp_path / "handoffs/current.json").write_text(text)
+
+    session.exec_as_agent = work
+    result = await session.execute(
+        SimpleNamespace(upload_file=AsyncMock()), "task", 3,
+        role="verifier", handoff_id="current", candidate_id="candidate",
+    )
+    assert result.status == "handoff"
+    assert result.report.verdict == verdict
+    assert result.report.report == text
+
+
 def test_event_accounting_and_precise_stagnation(tmp_path):
     journal = EventJournal(tmp_path / "stream", "s")
 

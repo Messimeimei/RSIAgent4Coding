@@ -42,10 +42,11 @@ class _PartialTraining(RuntimeError):
 class MemoryBaseline(BitfunBaseline):
     """Existing baseline loop; only memory attachment and training FAIL exit vary."""
 
-    def __init__(self, *args, memory, training=False, **kwargs):
+    def __init__(self, *args, memory, training=False, boundary_audit=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.memory = dict(memory)
         self.training = training
+        self.boundary_audit = boundary_audit
         self.active_actor = None
         self.terminal_report = None
         self.memory_delivered = set()
@@ -71,7 +72,12 @@ class MemoryBaseline(BitfunBaseline):
                         "evaluator feedback is available."
                     )
                 self.memory_delivered.add(session.session_id)
-        return await super()._invoke(session, environment, prompt, role, *args, **kwargs)
+        try:
+            return await super()._invoke(session, environment, prompt, role, *args, **kwargs)
+        finally:
+            if self.boundary_audit is not None:
+                self.boundary_audit.record_transcripts(
+                    session.logs_dir, authorized_instruction=self.boundary_audit.instruction)
 
 
 class BitfunRSI(BitfunCli):
@@ -161,6 +167,7 @@ class BitfunRSI(BitfunCli):
 
     def baseline(self, logs_dir, memory, *, training):
         return MemoryBaseline(logs_dir=Path(logs_dir), memory=memory, training=training,
+            boundary_audit=getattr(self, "boundary_audit", None),
             bitfun_config=self._bitfun_config, verifier_bitfun_config=self.verifier_config,
             binary_path=self._binary_path, output_patch_path=None,
             exec_agent=self._exec_agent, extra_env=self._extra_env, logger=self.logger,
@@ -395,6 +402,7 @@ class BitfunRSI(BitfunCli):
                 enabled=self.reference_context_policy).get("ai", {}).get("context_policy", {"mode": "native"}),
             "mode": "rsi", "parallel": self.parallel, "brs_project_budget": self.brs_project_budget,
             "isolate_failed_projects": self.isolate_failed_projects,
+            "leakage_boundary_policy": "record_only",
             "brs_budget_boundary": "after_complete_wave", "phase2_stop_policy": "curriculum_review",
             "drs_project_cap": None, "curriculum_memory_access": "read_only",
             "target_query_conditioned": True, "phase3_work_sec": self.total_timeout_sec,
@@ -407,6 +415,7 @@ class BitfunRSI(BitfunCli):
             "phase3": "fresh baseline with frozen memory; official evaluation only after phase3"})
         audit = CodingAudit(self.rsi_dir / "public-instruction-corpus.json", instruction,
                             environment.environment_dir.parent.parent)
+        self.boundary_audit = audit
         runtime = CodingRuntime(self, environment, self.rsi_dir / "runtime",
                                 asyncio.get_running_loop(), audit)
         result = {"status": "running", "phase": "phase1"}

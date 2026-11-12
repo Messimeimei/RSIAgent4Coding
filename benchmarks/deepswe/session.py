@@ -68,7 +68,9 @@ class BitfunSession(BitfunCli):
         args += ["--resume" if self.calls else "--session-id", self.session_id] # 决定是新建还是续跑
         stream_path = f"/logs/agent/stream-{self.session_id}-{self.calls + 1:03d}.jsonl"
         inner = (
-            "set -o pipefail\n" + bootstrap
+            # A role publishes its handoff from inside the container; keep it
+            # host-readable instead of inheriting a strict container umask.
+            "umask 022\nset -o pipefail\n" + bootstrap
             + shlex.join(args) + " < " + shlex.quote(prompt_path)
             + f" 2>&1 | tee {stream_path}\nexit ${{PIPESTATUS[0]}}"
         )
@@ -125,6 +127,12 @@ class BitfunSession(BitfunCli):
         self.last_outcome = None
         handoff_path = self.logs_dir / "handoffs" / f"{handoff_id}.json"    # 角色发布的报告
         handoff_path.parent.mkdir(parents=True, exist_ok=True)
+        # Container root may own the published file, so the directory must not
+        # block the host-side reader that validates it.
+        try:
+            os.chmod(handoff_path.parent, 0o777)
+        except OSError:
+            pass
         budget = work_budget or WorkBudget(timeout_sec) # baseline 的共享时间预算
 
         # 传入共享时间预算后，再启动模型中继

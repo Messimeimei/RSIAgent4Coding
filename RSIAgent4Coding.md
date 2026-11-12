@@ -213,9 +213,59 @@ checks 字段里面的 probe 就是需要进行自检查的内容，这个是进
 
 7. 失败发生在启动第二轮 Curriculum：prompt 经命令行嵌套转义后过长，报 [Errno 7] Argument list too long: 'docker'。 bitfun 把 prompt 直接通过命令行传入的方式，在连续多轮课程出题的时候，容易过长导致报错
 
-## 五、RSIAgent 适配流程详解
+## 五、RSIAgent 适配结果
 
+datasets:
+  - path: /path/to/deep-swe/tasks
+    task_names:
+      - dateutil-rfc5545-timezone-interop（未通过-65/67）
+      - dynamodb-toolbox-lazy-recursive-schemas（通过）
+      - expr-try-catch-errors（通过）
+      - fastapi-implicit-head-options
+      - kcp-go-multiplexed-kcp-streams
+      - kgateway-consistent-hash-policy
+      - kombu-virtual-queue-dead-lettering
+      - koota-pair-relation-tracking（未通过-33/38）
+      - koota-query-predicates
+      - narwhals-rolling-window-suite
+      - oxvg-structural-selector-preservation（未通过-4/6）
+      - participle-grammar-conflict-analysis（通过）
+      - prometheus-transactional-reload-status（未通过-10/15）
+      - scriggo-method-declarations（通过）
+      - skrub-duration-encoding
+      - sql-formatter-bigquery-pipe-formatting（通过）
+      - superjson-error-stack-serialization（通过）
+      - tomlkit-toml-table-converters（通过）
+      - vitest-duration-sharding（通过）
+      - wasmi-trap-coredumps（未通过-20/22）
 
-## 六、RSIAgent 缺点
+## 六、RSIAgent 适配缺点
 
-1. DRS 阶段持续太长，无限探索。
+1. **探索成本高**：DRS 阶段持续太长，没设置全局成本导致无限探索。
+2. **Verifier 检查不严格**：actor 明明执行错误或还有不足，Verifier 会判断 PASS。在 phase2 总结的 PASS 记忆，会导致 phase3 阶段依赖错误的 PASS 记忆，导致解题失败。在 phase3 阶段 verifier 判断 PASS 的导致任务过早结束，没有发现剩余问题，actor 就提交了。
+
+| 内部 verifier 判定 | 官方 phase3 结果 | run 数 | 具体案例（f2p / 得分） | 这说明什么 |
+|---|---|---|---|---|
+| PASS | 1.0 满分 | 4 | participle 91/91、superjson 80/80、dynamodb 37/37 ×2 | 判对了，但这只占它 PASS 的一半 |
+| PASS | 0 分 | 4 | prometheus 10/15、wasmi 20/22、dateutil 65/67、koota-pair 33/38 | 假阳性：它放过了真错的代码。全是"漏 2-5 条隐藏测试"的近满分，它看不到 |
+| FAIL | 1.0 满分 | 4 | tomlkit 60/60、scriggo 48/48、sql-formatter 26/26、expr 79/79 | 假阴性：它否掉了真对的代码，白烧 2-3 小时重试（sql-formatter 判 4 轮、scriggo 判 3 轮） |
+| FAIL | 0 分 | 0 | 无 | 它连一次"正确的失败预警"都没给出 |
+
+3. **泄露检查不严谨**：内部检查过严格，包括敏感词的检查和文件修改的检查
+4. **记忆泛化性差**：记忆高度任务特化（都是具体仓库/具体 bug），跨任务迁移性差；换一个仓库，/home/user/evolution_project 全部作废。
+5. **bitfun适配有问题**：bitfun 会自动压缩会话，比论文设定的压缩阈值小很多，导致 actor 和 verifier 的会话内容被压缩很多次；同时 actor 和 verifie 的 prompt 是通过 user message 发送给bitfun，而不是作为 system prompt 注入
+6. **brs 练习未覆盖所有目标难点**：brs 生成的练习存在膨胀现象，练习多且 PASS 多的，最终不一定通过
+
+| 任务 | 生成练习 | PASS | FAIL | 隔离 | 记忆体量 | 官方分 |
+|---|---|---|---|---|---|---|
+| participle | 5 | 2 | 0 | 3 | 36 KB | 1.0 |
+| sql-formatter | 4 | 1 | 0 | 3 | 17 KB | 1.0 |
+| tomlkit | 5 | 4 | 0 | 1 | 76 KB | 1.0 |
+| scriggo | 5 | 3 | 1 | 1 | 94 KB | 1.0 |
+| superjson | 5 | 5 | 0 | 1 | 104 KB | 1.0 |
+| dynamodb | 10 | 8 | 2 | 0 | 305 KB | 1.0（重载） |
+| expr | 8 | 6 | 2 | 0 | 220 KB | 1.0（重载） |
+| wasmi | 6 | 3 | 1 | 2 | 72 KB | 0 |
+| prometheus | 8 | 8 | 0 | 0 | 149 KB | 0 |
+| dateutil | 9 | 9 | 0 | 0 | 210 KB | 0（重载） |
+| koota-pair | 10 | 9 | 1 | 0 | 329 KB | 0（重载） |

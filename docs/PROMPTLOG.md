@@ -1,5 +1,14 @@
 # Prompt changes
 
+## 2026-11-11 - Free-form Coding Verifier reports
+
+Baseline and RSI target/Phase 3 Verifiers now publish plain report text with the
+reference standalone VERDICT line. The runtime binds the private report path to
+the invocation and candidate. Separate JSON findings/evidence fields are no longer
+requested. Legacy JSON remains readable, including structured object findings;
+schema recovery errors identify field paths and error types without echoing values.
+The Actor protocol and reference prompts are unchanged.
+
 ## 2026-11-03 — Coding baseline method alignment
 
 Extracted `ACTOR_METHOD`, Agentic Verifier evidence/verdict blocks, and Verifier

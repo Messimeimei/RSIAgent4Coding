@@ -152,18 +152,20 @@ remain independently inventoried. Internal symlinks into the candidate are
 rebased into the copy. The copy is rebuilt for each inspection while its fixed
 path preserves native session identity.
 
-Tests and builds run in that copy. Only narrowly validated Vitest result-cache
-JSON (`node_modules/.vite/vitest/[optional SHA1]/results.json`), recognized new
-Python caches, and semantic-preserving Git index refreshes may differ there.
-Existing cache files in the original candidate remain protected. Source edits,
-unknown additions and arbitrary `.vite`/`.cache` files are rejected. Each
-inspection records `workspace.json` and both original/copy checks in `integrity.json`.
+Tests and builds run in that copy. Workspace changes are diagnostic only:
+BitFun temporary files, ESLint/Python/Vitest caches, build outputs, and other
+changes are recorded without rejecting the inspection. Git index refreshes are
+classified independently even when other workspace files changed. Original
+candidate and input-fixture checks remain strict. Each inspection records
+`workspace.json` and both original/copy checks in `integrity.json`; runtime events
+use `VERIFIER_WORKSPACE_CHANGED` with `training_action: continue`. Verifier prompts
+remain responsible for attributing evidence to the correct candidate version.
 Rust build output is redirected with `CARGO_TARGET_DIR`, outside published
 practice material and the Verifier's candidate copy.
 
 `tools/smoke_deepswe_cache.py` provides an offline, no-model integration check
 inside the official Koota task image. It runs real Vitest against an existing
-cache, verifies that only the copy changed, and checks rejection of a source edit.
+cache, verifies that only the copy changed, and checks workspace-edit diagnostics.
 
 ## Boundary and Completion Diagnostics
 
@@ -171,21 +173,30 @@ Candidate audit no longer decodes arbitrary binary bytes with replacement and
 joins them into artificial instruction text. UTF-8 text is scanned normally;
 binary artifacts are scanned as separate printable ASCII runs. Other-task
 matches require at least four distinct tokens and four tokens of length three
-or more. Meaningful copied instructions and protected evaluation paths still
-trigger rejection, including real strings embedded in binary artifacts.
+or more. Meaningful copied instructions and protected evaluation paths are
+recorded as leakage errors, including real strings embedded in binary artifacts.
 
 Transcript auditing uses native events, not the host-authored prompt metadata.
 Protected-path prohibitions quoted in prose do not count as filesystem actions;
 executed tool inputs and outputs remain audited. Practice prompts explicitly
 prohibit evaluation directories and specify the sole completion location and
 format. These prompt constraints do not constitute a new OS-level sandbox;
-actual boundary violations still reject the affected work. The configured
-subtask-isolation policy determines whether the whole training run must stop.
+All DeepSWE leakage checks use a record-only policy, even for actual access.
+Findings do not reject courses, reports or captured projects, remove memory files,
+isolate subtasks, or interrupt training. This applies to BRS, DRS, all role calls,
+memory distillation/reconciliation, and final Phase 3 Actor/Verifier calls.
+Runtime failures and candidate-integrity checks retain their existing behavior.
 
 Host-only `boundary-audit.json` records the rule, stream line/field or archive
 member and bounded matching evidence. Secrets are redacted before persistence;
 other-task matching text is not sent back to models. Reports are bounded to
 100 detailed findings while retaining the total count.
+
+`rsi/boundary-errors.jsonl` is the append-only run-level leakage record. Findings
+carry `status: error`, `severity: error`, `policy: record_only`, and
+`training_action: continue`; the runtime logs a warning and proceeds. Per-surface
+`boundary-audit.json` files retain their location and evidence details. Diagnostic
+write failures are logged without turning a leakage finding into a training stop.
 
 RSI completion parsing reports JSON location, stale identity, wrong boolean,
 unexpected fields or invalid checks without copying submitted content into the

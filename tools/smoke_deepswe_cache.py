@@ -52,10 +52,12 @@ def main():
         assert inventory([str(root)]) == before
         assert recover(before)['status'] == 'unchanged'
         (destination / 'answer.test.js').write_text('throw new Error("modified source")')
-        assert verify_working_copy(workspace)['status'] == 'rejected'
+        changed = verify_working_copy(workspace)
+        assert changed['status'] == 'changed' and 'answer.test.js' in changed['changed']
+        assert inventory([str(root)]) == before
         print(json.dumps({'status': 'passed', 'real_vitest': True,
             'cache_updates': result['result_caches'], 'original_unchanged': True,
-            'source_edit_rejected': True, 'model_calls': 0}, indent=2))
+            'workspace_edit_recorded': True, 'model_calls': 0}, indent=2))
 
 
 if __name__ == '__main__':

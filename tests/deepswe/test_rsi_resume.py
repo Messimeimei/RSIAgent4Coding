@@ -196,6 +196,7 @@ async def test_new_controller_rebuilds_session_identity_and_call_from_archive(st
     s.owner.logs_dir.mkdir(parents=True)
     audit = SimpleNamespace(instruction='public target', validate=lambda *a: {}, text=lambda *a, **kw: [],
         transcripts=lambda *a, **kw: [], captured=lambda *a, **kw: [], memory=lambda *a, **kw: {})
+    audit.record_text, audit.record_transcripts, audit.record_captured = audit.text, audit.transcripts, audit.captured
     runtime = CodingRuntime(s.owner, env, s.owner.rsi_dir / 'runtime', asyncio.get_running_loop(), audit)
     async def restore(environment, session, role, cwd):
         assert session.session_id == s.sid and session.calls == 2 and role == 'curriculum' and cwd == '/home/user'

@@ -71,7 +71,7 @@ def test_prohibition_prompt_does_not_self_trigger_but_actual_access_does(audit, 
     hits = audit.transcripts(tmp_path)
     assert hits[0]['kind'] == 'sealed-evaluation-surface'
     assert hits[0]['line'] == 1 and hits[0]['field'].endswith('.params.cmd')
-    assert json.loads((tmp_path / 'boundary-audit.json').read_text())['status'] == 'rejected'
+    assert json.loads((tmp_path / 'boundary-audit.json').read_text())['status'] == 'error'
 
 
 def cache_value(duration):
@@ -102,10 +102,11 @@ def test_existing_vitest_cache_can_change_only_in_verified_working_copy(tmp_path
 
 
 @pytest.mark.parametrize('mutation', ['source', 'missing', 'extra', 'fake_cache', 'symlink'])
-def test_working_copy_cannot_hide_source_changes_or_unrecognized_cache_files(tmp_path, mutation):
+def test_working_copy_changes_are_recorded_without_rejecting_original(tmp_path, mutation):
     root, cache = candidate(tmp_path)
     copy = tmp_path / 'scratch/candidate'
-    workspace = prepare_working_copy(inventory([str(root)]), copy)
+    before = inventory([str(root)])
+    workspace = prepare_working_copy(before, copy)
     if mutation == 'source':
         (copy / 'source.ts').write_text('export const answer = 0;')
     elif mutation == 'missing':
@@ -117,7 +118,10 @@ def test_working_copy_cannot_hide_source_changes_or_unrecognized_cache_files(tmp
     else:
         (copy / cache).unlink()
         (copy / cache).symlink_to(root / cache)
-    assert verify_working_copy(workspace)['status'] == 'rejected'
+    report = verify_working_copy(workspace)
+    assert report['status'] == 'changed'
+    assert report['changed'] and report['policy'] == 'record_only'
+    assert inventory([str(root)]) == before
 
 
 def test_copy_rebases_internal_links_without_touching_original(tmp_path):
@@ -154,6 +158,31 @@ def test_working_copy_git_stat_refresh_is_not_a_source_edit(tmp_path):
     subprocess.run(['git', '-C', str(copy), 'update-index', '--really-refresh'], check=True)
     report = verify_working_copy(workspace)
     assert report['status'] == 'verified'
+    assert report['git_index_metadata_drift'] == ['.git/index']
+    assert inventory([str(root)]) == before
+
+
+@pytest.mark.parametrize('artifact', ['.bitfun/tmp/write_example.tmp', '.eslintcache', 'dist/output.js'])
+def test_workspace_tool_outputs_do_not_make_git_refresh_an_error(tmp_path, artifact):
+    root, _ = candidate(tmp_path)
+    subprocess.run(['git', 'init', '-q', str(root)], check=True)
+    subprocess.run(['git', '-C', str(root), 'add', 'source.ts'], check=True)
+    subprocess.run(['git', '-C', str(root), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                    'commit', '-qm', 'base'], check=True)
+    before = inventory([str(root)])
+    copy = tmp_path / 'scratch/candidate'
+    workspace = prepare_working_copy(before, copy)
+    source = copy / 'source.ts'
+    previous = source.stat()
+    os.utime(source, ns=(previous.st_atime_ns, previous.st_mtime_ns + 2_000_000_000))
+    subprocess.run(['git', '-C', str(copy), 'update-index', '--really-refresh'], check=True)
+    output = copy / artifact
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text('tool output')
+    report = verify_working_copy(workspace)
+    assert report['status'] == 'changed' and report['training_action'] == 'continue'
+    assert artifact in report['added'] and artifact in report['changed']
+    assert '.git/index' not in report['changed']
     assert report['git_index_metadata_drift'] == ['.git/index']
     assert inventory([str(root)]) == before
 

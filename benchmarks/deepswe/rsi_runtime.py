@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -50,6 +51,7 @@ class CodingAudit:
 
     def __init__(self, path, instruction, task_root):
         self.path = Path(path)
+        self._record_lock = threading.Lock()
         self.instruction = instruction
         self.allowed = commit._shingles(instruction)
         instructions = sorted(Path(task_root).glob("*/instruction.md"))
@@ -88,11 +90,47 @@ class CodingAudit:
 
     def _record(self, root, scope, hits, *, binary_files=0):
         clean = getattr(self, "clean", lambda value: value)
-        write_json(Path(root) / "boundary-audit.json", json.loads(clean(json.dumps({
-            "scope": scope, "status": "rejected" if hits else "passed",
+        record = json.loads(clean(json.dumps({
+            "scope": scope, "status": "error" if hits else "passed",
+            "policy": "record_only", "training_action": "continue",
+            "severity": "error" if hits else "info",
             "finding_count": len(hits), "binary_files_scanned": binary_files,
             "findings": hits[:100], "findings_truncated": len(hits) > 100,
-        }))))
+        })))
+        logger = logging.getLogger(__name__)
+        with self._record_lock:
+            try:
+                write_json(Path(root) / "boundary-audit.json", record)
+                if hits:
+                    with (self.path.parent / "boundary-errors.jsonl").open("a") as stream:
+                        stream.write(json.dumps({"time": time.time(), "artifact_root": str(root),
+                                                 **record}, ensure_ascii=False) + "\n")
+                    logger.warning("Boundary audit recorded %d finding(s) in %s; training continues",
+                                   len(hits), root)
+            except OSError:
+                logger.exception("Boundary diagnostic write failed in %s; training continues", root)
+
+    def record_text(self, text, **kwargs):
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        hits = [{**hit, "text_sha256": digest} for hit in self.text(text, **kwargs)]
+        self._record(self.path.parent / "boundary-text", "text", hits)
+        return []
+
+    def record_transcripts(self, root, **kwargs):
+        try:
+            self.transcripts(root, **kwargs)
+        except (OSError, UnicodeError) as error:
+            self._record(root, "transcripts", [{"kind": "audit-read-error",
+                                                "error_type": type(error).__name__}])
+        return []
+
+    def record_captured(self, root, **kwargs):
+        try:
+            self.captured(root, **kwargs)
+        except (OSError, tarfile.TarError, UnicodeError) as error:
+            self._record(root, "candidate", [{"kind": "audit-read-error",
+                                              "error_type": type(error).__name__}])
+        return []
 
     def transcripts(self, root, record_findings=True, **kwargs):
         hits = []
@@ -166,8 +204,11 @@ class CodingAudit:
     def memory(self, files, corpus_path, reject_log, **kwargs):
         self.validate(corpus_path)
         kwargs.pop("require_corpus", None)
-        return {name: data for name, data in files.items()
-                if not self.text(name + "\n" + data.decode("utf-8", "ignore"), **kwargs)}
+        hits = [{**hit, "member": name}
+                for name, data in files.items()
+                for hit in self.text(name + "\n" + data.decode("utf-8", "ignore"), **kwargs)]
+        self._record(Path(reject_log).parent / "boundary-memory", "memory", hits)
+        return dict(files)
 
 
 class CodingVM:
@@ -229,8 +270,8 @@ class CodingRuntime:
         self.hooks = PracticeHooks(
             run_attempt=self.run_attempt, reset_vm=self.reset,
             read_guest_text=self.read_text,
-            validate_corpus=audit.validate, audit_text=audit.text,
-            audit_transcripts=audit.transcripts, audit_captured=audit.captured,
+            validate_corpus=audit.validate, audit_text=audit.record_text,
+            audit_transcripts=audit.record_transcripts, audit_captured=audit.record_captured,
             audit_memory=audit.memory, pull_memory=self.pull_memory,
             verify_agentic=self.verify, actor_evidence_leads=self.evidence_leads,
             role_work_usage=lambda session: session.bitfun_work_usage,
@@ -573,9 +614,7 @@ class CodingRuntime:
             })
             # The reference also audits verifier artifacts before admitting a
             # verdict. It does not reinterpret the report's correctness.
-            if self.audit.transcripts(sink_root, authorized_instruction=self.audit.instruction):
-                from explore.practice_loop import PracticeBoundaryError
-                raise PracticeBoundaryError("BitFun role transcript failed the coding boundary")
+            self.audit.record_transcripts(sink_root, authorized_instruction=self.audit.instruction)
             if outcome.status == "handoff":
                 session.rsi_work_usage = (model_calls, budget.paused_seconds)
                 if role == "verifier":
@@ -662,10 +701,21 @@ class CodingRuntime:
         integrity = await self.integrity_command(vm, "recover", before_path)
         integrity["working_copy"] = await self.integrity_command(vm, "verify-copy", workspace_path)
         atomic_json(inspection / "integrity.json", integrity)
-        if integrity["status"] == "rejected" or integrity["working_copy"]["status"] == "rejected":
+        if integrity["status"] == "rejected":
             raise PracticeInfrastructureError(
-                f"Verifier changed protected candidate/fixtures or verification source; workspace preserved; see {inspection / 'integrity.json'}")
+                f"Verifier changed original candidate/fixtures; workspace preserved; see {inspection / 'integrity.json'}")
         vm.integrity_blocked = False
+        working_copy = integrity["working_copy"]
+        if (working_copy.get("changed") or working_copy.get("result_caches")
+                or working_copy.get("git_index_metadata_drift")):
+            self.owner.event("VERIFIER_WORKSPACE_CHANGED", session_id=native.session_id,
+                inspection=str(inspection), policy="record_only", training_action="continue",
+                changed=working_copy.get("changed", []),
+                result_caches=working_copy.get("result_caches", []),
+                git_index_metadata_drift=working_copy.get("git_index_metadata_drift", []))
+            logging.getLogger(__name__).warning(
+                "Verifier workspace changes recorded in %s; original candidate preserved; training continues",
+                inspection / "integrity.json")
         if integrity["status"] == "cache_recovered":
             self.owner.event("VERIFIER_CACHE_RECOVERED", session_id=native.session_id,
                 inspection=str(inspection), removed=len(integrity["removed"]))

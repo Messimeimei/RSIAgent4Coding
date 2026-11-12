@@ -23,9 +23,15 @@ ALE uses the same baseline roles, with its own platform adapters.
 The current Agentic Verifier is the reference; its evidence doctrine is reused
 without adding the older inspector's prompt, probe limits or terminal protocol.
 Coding retains its native
-tools, committed Git candidates, isolated review copies and nonce-bound atomic
-JSON handoffs. The report field carries the complete free-form investigation;
-the envelope is transport, not a prescribed task checklist. The controller does
+tools, committed Git candidates, isolated review copies and atomic handoffs.
+Actor handoffs remain JSON. Verifiers publish a complete free-form text report
+with a standalone `VERDICT: PASS`, `VERDICT: FAIL`, or `VERDICT: UNVERIFIED` line,
+using the reference verdict parser. The runtime binds the invocation-specific
+report path to its candidate; the model need not supply identity or split its
+report into `findings`, `evidence`, or `evidence_requests` fields. The `.json`
+filename suffix is retained for transport compatibility, not as a content format.
+Legacy JSON reports remain readable, including object-valued findings, with
+their original invocation and candidate identity checks. The controller does
 not infer semantic coverage by counting tests; independent review owns judgment.
 
 The delivery path is `actor_prompt -> Actor BitFun session -> Actor configured
@@ -78,7 +84,8 @@ the task's no-network policy except for the authenticated model proxy allowlist.
    the SAME BitFun session and private scratch across candidates. Only its
    `BITFUN_HOME` and `/tmp/verifier-scratch` persist; credential configuration
    (`BITFUN_USER_ROOT`) is recreated inside each container, not host-mounted.
-4. Verifier publishes a candidate-bound terminal report. PASS requires positive
+4. Verifier publishes a free-form terminal report at the current invocation's
+   private report path, bound by the runtime to its candidate. PASS requires positive
    evidence for every material requirement. FAIL returns reproducible defects
    to the original Actor. UNVERIFIED returns specific evidence requests to that
    Actor; runtime probes run again, then the same Verifier independently rechecks.

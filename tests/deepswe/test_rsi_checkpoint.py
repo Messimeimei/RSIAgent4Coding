@@ -75,6 +75,7 @@ async def test_recovers_tar_transfer_or_fallback_without_replaying_handoff(tmp_p
     session.execute = AsyncMock(side_effect=execute)
     audit = SimpleNamespace(instruction="target", validate=lambda *a: {}, text=lambda *a: [],
         transcripts=lambda *a, **kw: [], captured=lambda *a: [], memory=lambda *a: {})
+    audit.record_text, audit.record_transcripts, audit.record_captured = audit.text, audit.transcripts, audit.captured
     owner = SimpleNamespace(parallel=1, role_configs=lambda: {"curriculum": {}},
                             _session=lambda *args: session)
     runtime = CodingRuntime(owner, env, tmp_path / "rsi/runtime", asyncio.get_running_loop(), audit)

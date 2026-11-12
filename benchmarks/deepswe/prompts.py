@@ -152,17 +152,6 @@ def verifier_prompt(
         handoff_id,
         candidate_id=candidate.candidate_id,
     )
-    example = {
-        "kind": "verifier_report",
-        "handoff_id": handoff_id,
-        "final": True,
-        "candidate_id": candidate.candidate_id,
-        "verdict": "UNVERIFIED",
-        "report": "Your complete lossless investigation report, with requirement-by-requirement evidence and unresolved conflicts.",
-        "findings": [],
-        "evidence": ["Actual command/file and observed result"],
-        "evidence_requests": ["Specific missing reproducible evidence, if any"],
-    }
     if actor_evidence_leads:
         actor_evidence_context = f"""ACTOR-SUPPLIED EVIDENCE LEADS — requested by your prior UNVERIFIED report:
 ---
@@ -216,21 +205,22 @@ Choose exactly one local verdict:
 {VERIFIER_UNVERIFIED_DECISION}
 
 CODING REPORT TRANSPORT:
-Use BitFun tools to publish the JSON envelope below, not the reference runtime's
-program/look/verifier-report action JSON. The envelope routes your decision; it
-does not prescribe a fixed testing strategy or constrain the prose report's shape.
-Preserve the complete investigation report in report, organized as you judge best.
-For FAIL, put actionable reproductions and expected versus observed behavior in
-findings. For UNVERIFIED, identify specific missing reproducible evidence in
-evidence_requests so the same Actor can supply leads for your independent recheck.
+Use BitFun tools to write your complete lossless investigation report as plain
+text, organized as you judge best. There is no required report schema or separate
+findings, evidence, or evidence_requests field. For FAIL, explain actionable
+reproductions and expected versus observed behavior. For UNVERIFIED, identify
+specific missing reproducible evidence so the same Actor can supply leads for
+your independent recheck.
 Missing reports or runtime errors are NOT verdicts.
 
-Write a terminal report atomically to {control["report_path"]}, then end the turn.
-Create its parent directory first. Publication is a done action; the runtime may
-settle the CLI immediately. Do not publish placeholders. Use exactly this schema:
-{json.dumps(example, indent=2)}
-For PASS use empty findings and evidence_requests. For FAIL include nonempty
-findings. All verdicts need actual evidence and a nonempty report.
+Write the report atomically to {control["report_path"]}, then end the turn.
+The .json suffix is a transport filename only: write plain report text, not a JSON
+envelope or a program/look/verifier-report action object. The runtime binds this
+path to the current invocation and candidate; do not add identity fields.
+Include exactly one standalone line outside quoted examples or code fences:
+VERDICT: PASS, VERDICT: FAIL, or VERDICT: UNVERIFIED.
+Create the parent directory first. Publication is a done action; the runtime may
+settle the CLI immediately. Do not publish placeholders.
 
 TASK:
 {instruction}

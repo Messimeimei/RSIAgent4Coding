@@ -305,6 +305,7 @@ async def test_native_session_continues_across_segment_and_records_only_done_pro
         _session=lambda logs, config: native, role_configs=lambda: {"actor": {}})
     audit = SimpleNamespace(instruction="target", validate=lambda *a: {}, text=lambda *a, **kw: [],
         transcripts=lambda *a, **kw: [], captured=lambda *a, **kw: [], memory=lambda *a, **kw: {})
+    audit.record_text, audit.record_transcripts, audit.record_captured = audit.text, audit.transcripts, audit.captured
     runtime = CodingRuntime(owner, environment, tmp_path / "runtime", asyncio.get_running_loop(), audit)
     result, session = await runtime.execute(SimpleNamespace(environment=environment),
         "independent-channel probes among your checks", "actor", tmp_path / "sink")

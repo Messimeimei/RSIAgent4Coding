@@ -15,7 +15,7 @@ import signal
 import sys
 from pathlib import Path
 
-ROOT = Path("/data/k8s/yx/RSIAgent4Coding")
+ROOT = Path(__file__).resolve().parents[3]
 RUNTIME = ROOT / ".runtime/deepswe"
 PHASE3 = RUNTIME / "phase3_eval"
 
@@ -28,6 +28,8 @@ def main(argv=None) -> int:
     parser.add_argument("--name", required=True)
     parser.add_argument("--env-file", type=Path, default=RUNTIME / "runtime.env")
     args = parser.parse_args(argv)
+    args.config = args.config.resolve()
+    args.env_file = args.env_file.resolve()
 
     os.chdir(ROOT)
     os.umask(0o077)

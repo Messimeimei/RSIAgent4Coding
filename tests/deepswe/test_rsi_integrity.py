@@ -222,10 +222,36 @@ async def test_verifier_real_drift_preserves_workspace_and_diagnostic(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('verdict,expected', [('PASS', 'pass'), ('FAIL', 'wrong')])
+async def test_workspace_changes_are_nonfatal_when_original_is_unchanged(tmp_path, verdict, expected):
+    runtime = object.__new__(CodingRuntime)
+    report = f'Observed candidate behavior.\nVERDICT: {verdict}\n'
+    runtime.execute = AsyncMock(return_value=(report, SimpleNamespace(
+        session_id='verifier-id', rsi_work_usage=(1, 0))))
+    changes = ['.bitfun/tmp/write_example.tmp', '.eslintcache', 'dist/output.js']
+    runtime.integrity_command = AsyncMock(side_effect=[{}, {'status': 'prepared'},
+        {'status': 'unchanged'}, {'status': 'changed', 'changed': changes,
+                                 'policy': 'record_only', 'training_action': 'continue'}])
+    events = []
+    runtime.owner = SimpleNamespace(event=lambda *a, **kw: events.append((a, kw)))
+    vm = SimpleNamespace()
+    cfg = SimpleNamespace(wall_clock_secs=100, max_iters=30, verifier_unverified_evidence=False)
+    result, returned = await runtime.verify_async('project', vm, cfg,
+        sink=SimpleNamespace(root=tmp_path), session=SimpleNamespace(inspections=0))
+    assert result == expected and returned == report and not vm.integrity_blocked
+    assert runtime.execute.await_count == 1
+    assert events[0][0] == ('VERIFIER_WORKSPACE_CHANGED',)
+    assert events[0][1]['changed'] == changes
+    saved = json.loads((tmp_path / 'inspection_001/integrity.json').read_text())
+    assert saved['working_copy']['policy'] == 'record_only'
+
+
+@pytest.mark.asyncio
 async def test_cancelled_native_operation_settles_before_runtime_close(tmp_path):
     owner = SimpleNamespace(parallel=1, role_configs=lambda: {"actor": {}}, event=lambda *a, **kw: None)
     audit = SimpleNamespace(validate=lambda *a: {}, text=lambda *a: [], transcripts=lambda *a: [],
                             captured=lambda *a: [], memory=lambda *a: {})
+    audit.record_text, audit.record_transcripts, audit.record_captured = audit.text, audit.transcripts, audit.captured
     runtime = CodingRuntime(owner, None, tmp_path / "runtime", asyncio.get_running_loop(), audit)
     started = asyncio.Event()
     settled = []

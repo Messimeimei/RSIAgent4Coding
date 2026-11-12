@@ -68,7 +68,11 @@ def test_coding_verifier_keeps_current_agentic_judgment_and_discrimination():
         VERIFIER_UNVERIFIED_DECISION,
     ):
         assert block in verifier
-    assert "complete investigation report in report" in verifier
+    assert "complete lossless investigation report as plain" in verifier
+    assert "There is no required report schema" in verifier
+    assert "VERDICT: PASS, VERDICT: FAIL, or VERDICT: UNVERIFIED" in verifier
+    assert '"findings":' not in verifier
+    assert "Use exactly this schema" not in verifier
     # A known wrong result must not be sent back merely as missing evidence.
     assert "Do not use UNVERIFIED when you already have concrete evidence" in verifier
     assert "keep investigating through a distinguishing channel" in verifier

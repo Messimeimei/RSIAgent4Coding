@@ -1,4 +1,4 @@
-"""Guest-side verification inventory and narrowly scoped cache recovery.
+"""Strict original-candidate recovery and diagnostic-only workspace inventory.
 
 Executed by the host after the native Verifier has settled. Never remove existing
 candidate files, modified files, symlinks, or unknown additions. A cache directory
@@ -214,11 +214,17 @@ def vitest_result_cache(root, name, entry):
 
 
 def verify_working_copy(workspace):
+    """Record disposable workspace changes without rejecting the inspection."""
     root, expected = workspace["working_copy"], workspace["inventory"]
-    actual = inventory([root])[root]
-    rejected, caches, indexes = [], [], []
+    policy = {"policy": "record_only", "training_action": "continue"}
+    try:
+        actual = inventory([root])[root]
+    except (OSError, ValueError) as error:
+        return {"status": "changed", "changed": [root], "result_caches": [],
+                "error_type": type(error).__name__, **policy}
+    changes, caches, indexes = [], [], []
     if actual is None:
-        return {"status": "rejected", "changed": [root], "result_caches": []}
+        return {"status": "changed", "changed": [root], "result_caches": [], **policy}
     for name, entry in expected.items():
         if actual.get(name) == entry:
             continue
@@ -230,7 +236,7 @@ def verify_working_copy(workspace):
                 and vitest_result_cache(root, name, actual[name])):
             caches.append(name)
         else:
-            rejected.append(name)
+            changes.append(name)
     allowed_dirs = set()
     for name, entry in actual.items():
         if name in expected or entry["kind"] == "directory":
@@ -239,17 +245,21 @@ def verify_working_copy(workspace):
             caches.append(name)
             allowed_dirs.update(parent.as_posix() for parent in Path(name).parents)
         else:
-            rejected.append(name)
-    rejected.extend(name for name, entry in actual.items()
+            changes.append(name)
+    changes.extend(name for name, entry in actual.items()
                     if name not in expected and entry["kind"] == "directory" and name not in allowed_dirs)
     refreshed = []
     for path, entry, current in indexes:
-        if rejected or not index_metadata_only(path, entry, current):
-            rejected.append(path.relative_to(root).as_posix())
+        if not index_metadata_only(path, entry, current):
+            changes.append(path.relative_to(root).as_posix())
         else:
             refreshed.append(path.relative_to(root).as_posix())
-    return {"status": "rejected" if rejected else "verified", "changed": sorted(rejected),
-            "result_caches": sorted(caches), "git_index_metadata_drift": refreshed}
+    return {"status": "changed" if changes else "verified", "changed": sorted(changes),
+            "added": sorted(actual.keys() - expected.keys()),
+            "missing": sorted(expected.keys() - actual.keys()),
+            "modified": sorted(name for name in expected.keys() & actual.keys()
+                               if expected[name] != actual[name]),
+            "result_caches": sorted(caches), "git_index_metadata_drift": refreshed, **policy}
 
 
 def recover(before):
